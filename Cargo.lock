@@ -3240,7 +3240,7 @@ dependencies = [
 
 [[package]]
 name = "rowbridge"
-version = "0.5.2"
+version = "0.6.0"
 dependencies = [
  "mysql_async",
  "rowbridge-core",
@@ -3257,7 +3257,7 @@ dependencies = [
 
 [[package]]
 name = "rowbridge-core"
-version = "0.5.2"
+version = "0.6.0"
 dependencies = [
  "clap",
  "futures-util",
