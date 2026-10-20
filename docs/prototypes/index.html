@@ -1,0 +1,26 @@
+<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><title>RowBridge UI 方案</title>
+<style>
+body{margin:0;background:#0f1115;color:#e6e9ef;font:13px/1.5 -apple-system,"PingFang SC",sans-serif;padding:24px}
+h1{font-size:18px;margin:0 0 4px}p.sub{color:#8b94a7;margin:0 0 20px;font-size:12.5px}
+.grid{display:grid;grid-template-columns:1fr 1fr;gap:18px;max-width:1500px}
+.card{background:#171a21;border:1px solid #2a2f3a;border-radius:10px;overflow:hidden;text-decoration:none;color:inherit;display:block;transition:border-color .15s}
+.card:hover{border-color:#4f8cff}
+.card img{width:100%;display:block;border-bottom:1px solid #2a2f3a}
+.meta{padding:11px 14px}
+.meta b{font-size:13.5px}
+.meta p{margin:4px 0 0;font-size:12px;color:#8b94a7;line-height:1.55}
+.tag{display:inline-block;font-size:10.5px;padding:1px 6px;border-radius:4px;background:#16233d;color:#4f8cff;margin-left:6px;vertical-align:middle}
+</style></head><body>
+<h1>RowBridge 界面方案</h1>
+<p class="sub">四种布局，点任意一张打开可交互原型（同尺寸 1280×848 渲染）。看完告诉我选哪个，或者哪几个元素想混搭。</p>
+<div class="grid">
+  <a class="card" href="a-dashboard.html"><img src="shot-a.png"><div class="meta"><b>A · 顶栏 Dashboard</b><span class="tag">最省空间</span>
+    <p>连接压成一条状态栏，几乎所有高度都留给表清单。选项常驻顶部，已选表 + 底部运行条同屏可见。</p></div></a>
+  <a class="card" href="b-split.html"><img src="shot-b.png"><div class="meta"><b>B · 侧栏 + 分栏</b><span class="tag">信息最全</span>
+    <p>左侧窄导航，中间源表树，右侧预检+进度+日志常驻不切页。缺点：左侧导航会被窗口红绿灯压住，需右移。</p></div></a>
+  <a class="card" href="c-dual-pane.html"><img src="shot-c.png"><div class="meta"><b>C · 双栏文件管理器</b><span class="tag">最贴操作</span>
+    <p>左「源」右「目标」并列，中间传输条。A→B 的搬运关系一眼看懂，目标端状态也一直可见。</p></div></a>
+  <a class="card" href="d-ide-tabs.html"><img src="shot-d.png"><div class="meta"><b>D · IDE 式工具栏 + 标签页</b><span class="tag">最像数据库工具</span>
+    <p>工具栏放连接和常用参数，右侧运行/预检/DDL/日志分标签。和 Chat2DB、Navicat 的操作习惯接近。</p></div></a>
+</div>
+</body></html>

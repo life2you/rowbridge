@@ -96,20 +96,24 @@ async function fillConnection(
   user: string,
   pass: string,
 ) {
+  // 新 UI 里连接表单默认收起，先展开
+  const toggle = await waitFor<HTMLButtonElement>(
+    `[data-testid="${side}-toggle-conn"]`,
+  );
+  if (toggle.textContent?.includes("切换")) toggle.click();
+  await sleep(150);
+
   setInput(await waitFor<HTMLInputElement>(`[data-testid="${side}-host"]`), host);
   setInput(await waitFor<HTMLInputElement>(`[data-testid="${side}-port"]`), port);
   setInput(
     await waitFor<HTMLInputElement>(`[data-testid="${side}-password"]`),
     pass,
   );
-  // 用户名默认就是 root，这里显式写一次以覆盖配置
-  const userInputs = document.querySelectorAll<HTMLInputElement>(
-    `[data-testid="${side}-host"]`,
-  );
-  void userInputs;
   void user;
   await sleep(120);
   (await waitFor<HTMLButtonElement>(`[data-testid="${side}-test"]`)).click();
+  // 测试成功后表单会自动收起
+  await sleep(400);
 }
 
 /** 主场景：两库之间同步若干表，验证 UI 全链路。 */
@@ -131,7 +135,7 @@ async function scenarioFull(): Promise<void> {
   report("两个连接均可连通", true);
 
   // 2. 选库
-  (await waitFor<HTMLButtonElement>('[data-testid="schema-db_a"]')).click();
+  setSelect(await waitFor<HTMLSelectElement>('[data-testid="src-schema"]'), "db_a");
   await waitFor('[data-testid="table-simple"]', 20000);
   report("库表树加载完成", true);
 
@@ -142,7 +146,7 @@ async function scenarioFull(): Promise<void> {
     await sleep(80);
   }
   await waitUntil(
-    () => document.body.innerText.includes("4 张"),
+    () => document.body.innerText.includes("已选 4 张"),
     "已选 4 张表",
   );
   report("已勾选 4 张表", true);
@@ -152,27 +156,29 @@ async function scenarioFull(): Promise<void> {
   await waitUntil(
     () => Array.from(dstSelect.options).some((o) => o.value === "db_b"),
     "目标库下拉出现 db_b",
-    15000,
+    20000,
   );
   const hasSrcOnlyDb = Array.from(dstSelect.options).some((o) => o.value === "db_c");
   report("目标库下拉来自目标连接", !hasSrcOnlyDb, hasSrcOnlyDb ? "疑似混入源库 db_c" : "");
   setSelect(dstSelect, "db_b");
 
-  // 5. 预检
+  // 5. 预检：结果应出现在底部抽屉里
   (await waitFor<HTMLButtonElement>('[data-testid="preflight"]')).click();
-  // 预检后应自动跳到第 3 步，用户必须能看到结果
-  const startBtn = await waitFor<HTMLButtonElement>('[data-testid="start"]', 30000);
+  // 注意：不能用「可同步」判断——左侧「全选可同步」一直存在，会立刻命中。
   await waitUntil(
-    () => document.body.innerText.includes("可同步"),
+    () => document.body.innerText.includes("预检通过") ||
+          document.body.innerText.includes("张被阻塞"),
     "预检结果展示",
     30000,
   );
+  await sleep(400);
+  const startBtn = await waitFor<HTMLButtonElement>('[data-testid="start"]', 30000);
   const preflightText = document.body.innerText;
   report(
-    "预检后自动进入结果页",
-    preflightText.includes("将建表") || preflightText.includes("目标表已存在"),
+    "预检后自动展开结果抽屉",
+    preflightText.includes("将建表") || preflightText.includes("目标已存在") || preflightText.includes("将新建"),
   );
-  report("按源表结构自动建表已规划", preflightText.includes("将建表"));
+  report("按源表结构自动建表已规划", preflightText.includes("将建表") || preflightText.includes("将新建"));
 
   // 6. 开始同步
   await waitUntil(() => !startBtn.disabled, "开始按钮可用", 15000);
@@ -181,13 +187,13 @@ async function scenarioFull(): Promise<void> {
   // 7. 等待同步完成
   await waitUntil(
     () =>
-      document.body.innerText.includes("同步完成") ||
+      document.body.innerText.includes("已完成") ||
       document.body.innerText.includes("已取消") ||
       document.body.innerText.includes("失败"),
     "同步结束",
     120000,
   );
-  const done = document.body.innerText.includes("同步完成");
+  const done = document.body.innerText.includes("已完成");
   report("同步执行完成", done, done ? "" : "未能确认完成状态");
 
   // 8. 断言行数

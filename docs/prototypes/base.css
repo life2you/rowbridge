@@ -1,0 +1,76 @@
+/* RowBridge UI 原型共用样式 */
+* { box-sizing: border-box; margin: 0; padding: 0; }
+:root {
+  --bg: #0f1115;
+  --panel: #171a21;
+  --panel2: #1e222b;
+  --border: #2a2f3a;
+  --text: #e6e9ef;
+  --muted: #8b94a7;
+  --dim: #5c6478;
+  --accent: #4f8cff;
+  --ok: #3fb950;
+  --warn: #d29922;
+  --err: #f85149;
+}
+html, body { height: 100%; }
+body {
+  background: var(--bg);
+  color: var(--text);
+  font: 13px/1.45 -apple-system, BlinkMacSystemFont, "SF Pro Text", "PingFang SC", sans-serif;
+  -webkit-font-smoothing: antialiased;
+  overflow: hidden;
+  height: 848px;
+  width: 1280px;
+}
+.mono { font-family: "SF Mono", ui-monospace, Menlo, monospace; font-size: 11.5px; }
+button { font: inherit; color: inherit; background: none; border: none; cursor: pointer; }
+input, select { font: inherit; color: var(--text); background: var(--panel2); border: 1px solid var(--border); border-radius: 6px; padding: 5px 8px; outline: none; }
+input:focus, select:focus { border-color: var(--accent); }
+input::placeholder { color: var(--dim); }
+
+.titlebar {
+  height: 38px; display: flex; align-items: center; gap: 10px;
+  padding-left: 78px; padding-right: 12px;
+  background: var(--panel); border-bottom: 1px solid var(--border); flex-shrink: 0;
+}
+.lights { position: absolute; left: 14px; top: 13px; display: flex; gap: 7px; }
+.light { width: 11px; height: 11px; border-radius: 50%; }
+.l1 { background: #ff5f57; } .l2 { background: #febc2e; } .l3 { background: #28c840; }
+.brand { font-weight: 600; font-size: 13px; }
+.brand-sub { font-size: 10px; color: var(--muted); }
+
+.btn {
+  display: inline-flex; align-items: center; justify-content: center; gap: 6px;
+  padding: 5px 12px; border-radius: 6px; font-size: 12.5px; font-weight: 500;
+  border: 1px solid var(--border); background: var(--panel2); white-space: nowrap;
+}
+.btn:hover { background: #252a35; border-color: #3d4553; }
+.btn-primary { background: var(--accent); border-color: transparent; color: #fff; }
+.btn-primary:hover { background: #6a9dff; }
+.btn-ghost { border-color: transparent; background: none; color: var(--muted); }
+.btn-ghost:hover { background: #222733; color: var(--text); }
+.btn-sm { padding: 3px 9px; font-size: 11.5px; }
+
+.badge { display: inline-flex; align-items: center; padding: 1px 6px; border-radius: 4px; font-size: 10.5px; font-weight: 500; }
+.b-muted { background: #242935; color: var(--muted); }
+.b-ok { background: #16301c; color: var(--ok); }
+.b-warn { background: #33280e; color: var(--warn); }
+.b-err { background: #3a1a1d; color: var(--err); }
+.b-accent { background: #16233d; color: var(--accent); }
+
+.check {
+  appearance: none; width: 14px; height: 14px; border: 1px solid #3d4553;
+  border-radius: 3px; background: var(--panel2); cursor: pointer; flex-shrink: 0; position: relative;
+}
+.check:checked { background: var(--accent); border-color: var(--accent); }
+.check:checked::after {
+  content: ""; position: absolute; left: 4px; top: 1px; width: 4px; height: 8px;
+  border: solid #fff; border-width: 0 2px 2px 0; transform: rotate(45deg);
+}
+.check:disabled { opacity: .3; cursor: not-allowed; }
+
+.scroll { overflow-y: auto; }
+.scroll::-webkit-scrollbar { width: 9px; }
+.scroll::-webkit-scrollbar-thumb { background: #333a47; border-radius: 5px; border: 2px solid var(--bg); }
+.scroll::-webkit-scrollbar-track { background: transparent; }

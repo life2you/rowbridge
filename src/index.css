@@ -61,6 +61,38 @@ select {
   color: var(--color-text);
   outline: none;
   font-size: 13px;
+  font-family: inherit;
+}
+
+/* macOS 原生 select 会带上巨大的圆角按钮样式，覆盖掉 */
+select {
+  appearance: none;
+  -webkit-appearance: none;
+  padding-right: 24px;
+  background-image: url("data:image/svg+xml;charset=utf-8,%3Csvg xmlns='http://www.w3.org/2000/svg' width='10' height='6' viewBox='0 0 10 6'%3E%3Cpath fill='%238b94a7' d='M0 0h10L5 6z'/%3E%3C/svg%3E");
+  background-repeat: no-repeat;
+  background-position: right 8px center;
+  cursor: pointer;
+}
+select option {
+  background: var(--color-panel-2);
+  color: var(--color-text);
+}
+
+/* 数字输入框的上下箭头在深色界面里很扎眼 */
+input[type="number"]::-webkit-inner-spin-button,
+input[type="number"]::-webkit-outer-spin-button {
+  -webkit-appearance: none;
+  margin: 0;
+}
+input[type="number"] {
+  -moz-appearance: textfield;
+  appearance: textfield;
+}
+
+input[type="checkbox"] {
+  cursor: pointer;
+  accent-color: var(--color-accent);
 }
 input:focus,
 select:focus {
