@@ -77,6 +77,16 @@ export interface ColumnInfo {
   is_primary: boolean;
 }
 
+/** 勾选表时异步校验的结果 */
+export interface ValidatedTable {
+  name: string;
+  primary_key: string | null;
+  primary_key_unsigned: boolean;
+  unsupported_reason: string | null;
+  max_pk: number | null;
+  trigger_count: number;
+}
+
 export interface TableDetail {
   schema: string;
   table: string;

@@ -85,6 +85,19 @@ pub struct TestResult {
     pub schemas: usize,
 }
 
+#[derive(Debug, Serialize)]
+pub struct TableRow {
+    pub name: String,
+    pub rows_estimate: u64,
+    pub engine: Option<String>,
+    pub primary_key: Option<String>,
+    pub unsupported_reason: Option<String>,
+    pub is_view: bool,
+    /// 主键最大值。懒加载：列表快路径不取，勾选时由 validate_tables 填。
+    pub max_pk: Option<u64>,
+}
+
+
 #[tauri::command]
 pub async fn test_connection(form: ConnForm) -> Result<TestResult, String> {
     let cfg = form.resolve()?;
@@ -123,60 +136,148 @@ pub async fn list_tables(
         .await
         .map_err(|e| format!("连接失败: {e}"))?;
 
+    // 快路径：只做 2 个查询。
+    // 1. TABLES 拿表清单
+    // 2. 全库主键（一次批量），用于「不支持」置灰
+    // 重活（COLUMNS/TRIGGERS/MAX(id)）交给 validate_tables，勾选时按需执行。
     let tables = introspect::list_tables(&mut conn, &schema).await.map_err(err)?;
+    let pk_rows = introspect::list_primary_keys(&mut conn, &schema).await.map_err(err)?;
+
+    // (表名 -> (按序主键列, 复合主键))
+    let mut pk_map: std::collections::HashMap<String, (Vec<String>, bool)> =
+        std::collections::HashMap::new();
+    for (table, col, _seq, _non_unique) in pk_rows {
+        let e = pk_map.entry(table).or_insert_with(|| (Vec::new(), false));
+        e.0.push(col);
+    }
+
     let mut out = Vec::with_capacity(tables.len());
     for t in tables {
-        // 每张表都取一次主键，用于列表上的「可同步/不支持」标记。
-        let detail = introspect::table_detail(&mut conn, &schema, &t.name).await.ok();
-        let (pk, reason, max_pk) = match &detail {
-            Some(d) => match d.pk_column() {
-                Ok(col) => {
-                    // 只有整型主键才能直接转 u64
-                    let max: Option<u64> = mysql_async::prelude::Queryable::query_first::<Option<u64>, _>(
-                        &mut conn,
-                        format!(
-                            "SELECT MAX({}) FROM {}",
-                            rowbridge_core::value::quote_ident(&col.name),
-                            rowbridge_core::value::qualified(&schema, &t.name)
-                        ),
-                    )
-                    .await
-                    .ok()
-                    .flatten()
-                    .flatten();
-                    (Some(col.name.clone()), None, max)
-                }
-                Err(e) => (d.primary_key.first().cloned(), Some(e.to_string()), None),
-            },
-            None => (None, Some("读取表结构失败".into()), None),
-        };
+        let mut primary_key: Option<String> = None;
+        let mut unsupported_reason: Option<String> = None;
+        if t.table_type.as_deref().map(|ty| ty.eq_ignore_ascii_case("VIEW")).unwrap_or(false) {
+            unsupported_reason = Some("视图".into());
+        } else if let Some((cols, _)) = pk_map.get(&t.name) {
+            if cols.len() > 1 {
+                unsupported_reason = Some(format!("复合主键 ({})", cols.join(", ")));
+            } else if cols.len() == 1 {
+                primary_key = Some(cols[0].clone());
+                // 主键列类型是否为整型？信息不在 STATISTICS 里，需要 COLUMNS。
+                // 快路径先不判——置灰只拦「复合/无主键」，
+                // 整型校验留给勾选时的 validate_tables。
+            }
+        } else {
+            unsupported_reason = Some("无主键".into());
+        }
+
         out.push(TableRow {
             name: t.name,
             rows_estimate: t.rows_estimate.unwrap_or(0),
             engine: t.engine,
-            primary_key: pk,
-            unsupported_reason: reason,
-            is_view: t
-                .table_type
-                .map(|ty| ty.eq_ignore_ascii_case("VIEW"))
-                .unwrap_or(false),
-            max_pk,
+            primary_key,
+            unsupported_reason,
+            is_view: t.table_type.as_deref().map(|ty| ty.eq_ignore_ascii_case("VIEW")).unwrap_or(false),
+            max_pk: None, // 懒加载：勾选时才取
         });
     }
     let _ = conn.disconnect().await;
     Ok(out)
 }
 
+/// 勾选表时按需校验（重活懒加载）。
+///
+/// 逐表做：COLUMNS（主键类型是否整型）、TRIGGERS、MAX(pk)。
+/// 限流并发 ≤3，复用同一个连接，不再每表开新连接。
+#[tauri::command]
+pub async fn validate_tables(
+    form: ConnForm,
+    schema: String,
+    tables: Vec<String>,
+) -> Result<Vec<ValidatedTable>, String> {
+    let cfg = form.resolve()?;
+    let conn = mysql_async::Conn::new(cfg.to_url().map_err(err)?)
+        .await
+        .map_err(|e| format!("连接失败: {e}"))?;
+    let conn = std::sync::Arc::new(tokio::sync::Mutex::new(conn));
+    let sem = std::sync::Arc::new(tokio::sync::Semaphore::new(3));
+
+    let mut futs = Vec::new();
+    for t in tables {
+        let conn = conn.clone();
+        let sem = sem.clone();
+        let schema = schema.clone();
+        futs.push(tokio::spawn(async move {
+            let _permit = match sem.acquire_owned().await {
+                Ok(p) => p,
+                Err(_) => return None,
+            };
+            let mut guard = conn.lock().await;
+            validate_one(&mut guard, &schema, &t).await.ok()
+        }));
+    }
+
+    let mut out = Vec::new();
+    for f in futs {
+        if let Ok(Some(v)) = f.await {
+            out.push(v);
+        }
+    }
+    // 保持入参顺序稳定
+    out.sort_by(|a, b| a.name.cmp(&b.name));
+    Ok(out)
+}
+
 #[derive(Debug, Serialize)]
-pub struct TableRow {
+pub struct ValidatedTable {
     pub name: String,
-    pub rows_estimate: u64,
-    pub engine: Option<String>,
     pub primary_key: Option<String>,
+    pub primary_key_unsigned: bool,
     pub unsupported_reason: Option<String>,
-    pub is_view: bool,
-    /// 主键最大值。逐表游标要靠它做区间行数估算，没有它就只能是瞎猜。
     pub max_pk: Option<u64>,
+    pub trigger_count: usize,
+}
+
+async fn validate_one(
+    conn: &mut mysql_async::Conn,
+    schema: &str,
+    table: &str,
+) -> Result<ValidatedTable, String> {
+    let detail = introspect::table_detail(conn, schema, table).await.map_err(err)?;
+    let (primary_key, primary_key_unsigned, unsupported_reason) = match detail.pk_column() {
+        Ok(col) => (
+            Some(col.name.clone()),
+            col.column_type.to_ascii_lowercase().contains("unsigned"),
+            None,
+        ),
+        Err(e) => (detail.primary_key.first().cloned(), false, Some(e.to_string())),
+    };
+
+    let max_pk = match &primary_key {
+        Some(pk) if unsupported_reason.is_none() => {
+            use mysql_async::prelude::*;
+            let max: Option<u64> = conn
+                .query_first(format!(
+                    "SELECT MAX({}) FROM {}",
+                    rowbridge_core::value::quote_ident(pk),
+                    rowbridge_core::value::qualified(schema, table)
+                ))
+                .await
+                .ok()
+                .flatten()
+                .flatten();
+            max
+        }
+        _ => None,
+    };
+
+    Ok(ValidatedTable {
+        name: table.to_string(),
+        primary_key,
+        primary_key_unsigned,
+        unsupported_reason,
+        max_pk,
+        trigger_count: detail.triggers.len(),
+    })
 }
 
 /// 读取表结构，用于详情面板。

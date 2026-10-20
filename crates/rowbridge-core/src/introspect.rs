@@ -337,3 +337,23 @@ mod tests {
         assert_eq!(parse_version("garbage"), (0, 0, 0));
     }
 }
+
+/// 一次查询拿全库所有表的主键（替代逐表查 STATISTICS）。
+/// 返回 (表名, 主键列名, 该主键是否单列)。
+/// 复合主键多行返回，调用方靠列数判断。
+pub async fn list_primary_keys(
+    conn: &mut mysql_async::Conn,
+    schema: &str,
+) -> Result<Vec<(String, String, u32, u32)>> {
+    use mysql_async::prelude::*;
+    let rows: Vec<(String, String, u32, u32)> = conn
+        .exec(
+            "SELECT TABLE_NAME, COLUMN_NAME, SEQ_IN_INDEX, NON_UNIQUE
+             FROM information_schema.STATISTICS
+             WHERE TABLE_SCHEMA = ? AND INDEX_NAME = 'PRIMARY'
+             ORDER BY TABLE_NAME, SEQ_IN_INDEX",
+            (schema,),
+        )
+        .await?;
+    Ok(rows)
+}

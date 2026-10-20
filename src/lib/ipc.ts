@@ -9,6 +9,7 @@ import type {
   TableDetail,
   TableRow,
   TaskReport,
+  ValidatedTable,
   SavedConnection,
   TaskSummary,
   TestResult,
@@ -23,6 +24,10 @@ export const api = {
 
   listTables: (form: ConnForm, schema: string) =>
     invoke<TableRow[]>("list_tables", { form, schema }),
+
+  /** 勾选表后异步校验（重活懒加载，限流并发 3） */
+  validateTables: (form: ConnForm, schema: string, tables: string[]) =>
+    invoke<ValidatedTable[]>("validate_tables", { form, schema, tables }),
 
   describeTable: (form: ConnForm, schema: string, table: string) =>
     invoke<TableDetail>("describe_table", { form, schema, table }),

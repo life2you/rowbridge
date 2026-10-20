@@ -488,9 +488,15 @@ async function scenarioPickSaved(): Promise<void> {
 
   // 选已保存的数据源，不填密码
   const savedSel = await waitFor<HTMLSelectElement>('[data-testid="src-saved"]');
-  const opt = Array.from(savedSel.options).find((o) => o.value !== "");
+  // 找本地测试数据源（e2e 场景专属）；没有就跳过该场景
+  const opt = Array.from(savedSel.options).find(
+    (o) => o.textContent?.includes("本地测试") && o.value !== "",
+  );
   if (!opt) {
-    report("有已保存数据源可选", false, "下拉里没有条目");
+    report("有本地测试数据源可选", false, "下拉里没有『本地测试』数据源（跳过勾选验证）");
+    window.dispatchEvent(new CustomEvent("e2e-done", { detail: results }));
+    (window as unknown as { __E2E_RESULTS__: typeof results }).__E2E_RESULTS__ = results;
+    return;
   } else {
     setSelect(savedSel, opt.value);
     await sleep(600);
@@ -521,7 +527,51 @@ async function scenarioPickSaved(): Promise<void> {
   (window as unknown as { __E2E_RESULTS__: typeof results }).__E2E_RESULTS__ = results;
 }
 
+/** 新 UI：数据源下拉只显示已保存的、列表懒加载校验。 */
+async function scenarioLazyList(): Promise<void> {
+  overlay();
+  await sleep(1500);
+
+  // 下拉里应只有已保存的数据源，没有「编辑」按钮
+  const savedSel = await waitFor<HTMLSelectElement>('[data-testid="src-saved"]');
+  const names = Array.from(savedSel.options).map((o) => o.textContent ?? "");
+  const hasEdit = !!document.querySelector('[data-testid="src-toggle-conn"]');
+  report("下拉只显示已保存的数据源", names.every((n) => n.includes("·") || n.startsWith("—")));
+  report("同步主界面没有编辑按钮", !hasEdit);
+
+  // 找本地测试数据源（e2e 场景专属）；没有就跳过该场景
+  const opt = Array.from(savedSel.options).find(
+    (o) => o.textContent?.includes("本地测试") && o.value !== "",
+  );
+  if (!opt) {
+    report("有本地测试数据源可选", false, "下拉里没有『本地测试』数据源（跳过勾选验证）");
+    window.dispatchEvent(new CustomEvent("e2e-done", { detail: results }));
+    (window as unknown as { __E2E_RESULTS__: typeof results }).__E2E_RESULTS__ = results;
+    return;
+  } else {
+    setSelect(savedSel, opt.value);
+    await sleep(600);
+    setSelect(await waitFor<HTMLSelectElement>('[data-testid="src-schema"]'), "db_a");
+    await waitFor('[data-testid="table-simple"]', 20000);
+    const t0 = Date.now();
+    // 勾选触发异步校验
+    const cb = await waitFor<HTMLInputElement>('[data-testid="table-simple"]');
+    if (!cb.checked) cb.click();
+    await waitUntil(
+      () => document.body.innerText.includes("max"),
+      "校验结果出现 max(pk)",
+      20000,
+    );
+    report("勾选后异步校验返回 max(pk)", true);
+    report(`列表加载耗时 ${Date.now() - t0}ms（含勾选校验）`, true);
+  }
+
+  window.dispatchEvent(new CustomEvent("e2e-done", { detail: results }));
+  (window as unknown as { __E2E_RESULTS__: typeof results }).__E2E_RESULTS__ = results;
+}
+
 const scenarios: Record<string, Step[]> = {
+  lazylist: [{ name: "lazylist", run: scenarioLazyList }],
   picksaved: [{ name: "picksaved", run: scenarioPickSaved }],
   datasource_cleanup: [{ name: "cleanup", run: scenarioDataSourceCleanup }],
   batchctl: [{ name: "batchctl", run: scenarioBatchCtl }],

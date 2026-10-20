@@ -1,7 +1,8 @@
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { api, errorMessage } from "./lib/ipc";
 import type {
   ConnForm,
+  ValidatedTable,
   SavedConnection,
   OptionsForm,
   PreflightReport,
@@ -74,6 +75,11 @@ export default function App() {
   const [preflightError, setPreflightError] = useState<string | null>(null);
 
   const [savedConns, setSavedConns] = useState<SavedConnection[]>([]);
+  // 已通过 validate_tables 校验的表：表名 -> 校验结果
+  const [validated, setValidated] = useState<Record<string, ValidatedTable>>({});
+  const [validating, setValidating] = useState<Set<string>>(new Set());
+  // 串行队列：连勾多张时依次校验（后端限流 3，这里再限前端每批最多 3）
+  const validateQueueRef = useRef<string[]>([]);
 
 
   const [run, setRun] = useState<RunState>(emptyRun);
@@ -174,21 +180,72 @@ export default function App() {
     }
   }
 
-  async function deleteSaved(id: string) {
-    try {
-      setSavedConns(await api.removeConnection(id));
-    } catch {
-      /* 忽略 */
-    }
-  }
-
   // ---- 选择 ----
-  const toggleTable = (name: string) =>
+  const toggleTable = (name: string) => {
     setSelected((prev) => {
       const n = new Set(prev);
-      n.has(name) ? n.delete(name) : n.add(name);
+      if (n.has(name)) {
+        n.delete(name);
+      } else {
+        n.add(name);
+        // 勾选后异步校验这张表（重活懒加载）
+        enqueueValidate(name);
+      }
       return n;
     });
+  };
+
+  const selectAll = (names: string[]) => {
+    setSelected(new Set(names));
+    for (const n of names) enqueueValidate(n);
+  };
+
+  // 校验队列：防抖合并，最多同时发 3 个请求
+  const enqueueValidate = (name: string) => {
+    if (validated[name] || validating.has(name)) return;
+    validateQueueRef.current.push(name);
+    scheduleValidate();
+  };
+
+  const validateTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const scheduleValidate = () => {
+    if (validateTimerRef.current) return;
+    validateTimerRef.current = setTimeout(async () => {
+      validateTimerRef.current = null;
+      const batch = validateQueueRef.current
+        .filter((n) => !validated[n] && !validating.has(n))
+        .slice(0, 3);
+      validateQueueRef.current = [];
+      if (batch.length === 0) return;
+      setValidating((prev) => new Set([...prev, ...batch]));
+      try {
+        const results = await api.validateTables(srcConn, srcSchema!, batch);
+        setValidated((prev) => {
+          const next = { ...prev };
+          for (const r of results) next[r.name] = r;
+          return next;
+        });
+        // 若校验发现不可同步（列级问题），自动取消勾选
+        setSelected((prev) => {
+          const n = new Set(prev);
+          for (const r of results) {
+            if (r.unsupported_reason) n.delete(r.name);
+          }
+          return n;
+        });
+      } catch {
+        /* 校验失败保持现状，预检会再查 */
+      } finally {
+        setValidating((prev) => {
+          const next = new Set(prev);
+          for (const n of batch) next.delete(n);
+          return next;
+        });
+        // 队列里可能还有新的，继续
+        if (validateQueueRef.current.length > 0) scheduleValidate();
+      }
+    }, 150);
+  };
 
   const selectedList = useMemo(
     () => tables.filter((t) => selected.has(t.name)),
@@ -359,7 +416,6 @@ export default function App() {
             <TablePane
               side="src"
               conn={src}
-              onConnChange={setSrc}
               schemas={srcSchemas}
               schema={srcSchema}
               onSchemaChange={setSrcSchema}
@@ -367,14 +423,13 @@ export default function App() {
               loading={loadingTables}
               selected={selected}
               onToggle={toggleTable}
-              onSelectAll={(names) => setSelected(new Set(names))}
+              onSelectAll={selectAll}
               totalRows={totalRows}
               disabled={run.running}
+              validated={validated}
+              validating={validating}
               saved={savedConns}
               onPickSaved={(c) => pickSaved("src", c)}
-              onDeleteSaved={deleteSaved}
-              onSaved={setSavedConns}
-              onManage={() => setShowDataSources(true)}
             />
 
             <div className="relative flex min-w-[560px] flex-1 flex-col">
@@ -422,7 +477,6 @@ export default function App() {
             <TablePane
               side="dst"
               conn={dst}
-              onConnChange={setDst}
               schemas={dstSchemas}
               schema={dstSchema}
               onSchemaChange={setDstSchema}
@@ -436,9 +490,8 @@ export default function App() {
               existing={report?.tables.filter((t) => t.target_rows_exists).length ?? 0}
               saved={savedConns}
               onPickSaved={(c) => pickSaved("dst", c)}
-              onDeleteSaved={deleteSaved}
-              onSaved={setSavedConns}
-              onManage={() => setShowDataSources(true)}
+              validated={{}}
+              validating={new Set()}
             />
           </div>
 

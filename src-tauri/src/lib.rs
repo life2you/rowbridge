@@ -30,6 +30,7 @@ pub fn run() {
             commands::test_connection,
             commands::list_schemas,
             commands::list_tables,
+            commands::validate_tables,
             commands::describe_table,
             commands::preflight,
             commands::start_sync,

@@ -1,9 +1,8 @@
-import { useEffect, useState } from "react";
-import { api, errorMessage } from "../lib/ipc";
-import type { SavedConnection, SchemaInfo, TableRow } from "../lib/types";
+import { useState } from "react";
+import type { SavedConnection, SchemaInfo, TableRow, ValidatedTable } from "../lib/types";
 import type { ConnectionDraft } from "./ConnectionEditor";
 import { cn, formatInt } from "../lib/format";
-import { Badge, Button, Spinner } from "./ui";
+import { Badge, Spinner } from "./ui";
 
 /**
  * 源 / 目标的一侧面板。
@@ -14,7 +13,6 @@ import { Badge, Button, Spinner } from "./ui";
 export function TablePane({
   side,
   conn,
-  onConnChange,
   schemas,
   schema,
   onSchemaChange,
@@ -29,13 +27,11 @@ export function TablePane({
   existing = 0,
   saved,
   onPickSaved,
-  onDeleteSaved,
-  onSaved,
-  onManage,
+  validated,
+  validating,
 }: {
   side: "src" | "dst";
   conn: ConnectionDraft;
-  onConnChange: (c: ConnectionDraft) => void;
   schemas: SchemaInfo[];
   schema: string | null;
   onSchemaChange: (s: string | null) => void;
@@ -51,70 +47,14 @@ export function TablePane({
   /** 已保存的数据源列表 */
   saved: SavedConnection[];
   onPickSaved: (c: SavedConnection) => void;
-  onDeleteSaved: (id: string) => void;
-  /** 保存后回传最新列表，父组件刷新下拉 */
-  onSaved: (list: SavedConnection[]) => void;
-  /** 打开数据源管理面板 */
-  onManage: () => void;
+  /** 勾选后异步校验的结果缓存 */
+  validated: Record<string, ValidatedTable>;
+  validating: Set<string>;
 }) {
-  const [showConn, setShowConn] = useState(false);
   const [filter, setFilter] = useState("");
-  const [testing, setTesting] = useState(false);
-  const [saving, setSaving] = useState(false);
-  const [connName, setConnName] = useState("");
-  const [testResult, setTestResult] = useState<
-    { ok: true; version: string; schemas: number } | { ok: false; error: string } | null
-  >(null);
 
   const isSrc = side === "src";
   const dot = isSrc ? "var(--color-accent)" : "var(--color-ok)";
-
-  const set = <K extends keyof ConnectionDraft>(k: K, v: ConnectionDraft[K]) =>
-    onConnChange({ ...conn, [k]: v });
-
-  // 切换连接或已有名称时同步到输入框
-  useEffect(() => {
-    const existing = saved.find((c) => c.id === conn.id);
-    setConnName(existing?.name ?? conn.label ?? "");
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [conn.id, saved.length]);
-
-  async function handleSave() {
-    setSaving(true);
-    try {
-      const list = await api.saveConnection({
-        id: conn.id,
-        name: connName.trim() || `${conn.host}:${conn.port}`,
-        host: conn.host,
-        port: conn.port,
-        username: conn.username,
-        password: conn.password ?? "",
-        use_tls: !!conn.use_tls,
-        last_schema: null,
-      });
-      onSaved(list);
-    } finally {
-      setSaving(false);
-    }
-  }
-
-  async function handleTest() {
-    setTesting(true);
-    setTestResult(null);
-    try {
-      const r = await api.testConnection(conn);
-      setTestResult({ ok: true, version: r.version, schemas: r.schemas });
-      if (conn.password) {
-        onConnChange({ ...conn, passwordSaved: true });
-      }
-      // 连上后收起表单，把空间还给表清单
-      setShowConn(false);
-    } catch (e) {
-      setTestResult({ ok: false, error: errorMessage(e) });
-    } finally {
-      setTesting(false);
-    }
-  }
 
   const visible = tables.filter((t) =>
     filter.trim() ? t.name.toLowerCase().includes(filter.trim().toLowerCase()) : true,
@@ -142,128 +82,20 @@ export function TablePane({
           value={saved.some((c) => c.id === conn.id) ? conn.id : ""}
           disabled={disabled}
           onChange={(e) => {
-            if (e.target.value === "__manage__") {
-              onManage();
-              return;
-            }
             const c = saved.find((x) => x.id === e.target.value);
             if (c) onPickSaved(c);
           }}
           className="mono min-w-0 flex-1 !py-[2px] !text-[10.5px]"
           title="选择已保存的数据源"
         >
-          <option value="">
-            {conn.host}:{conn.port}
-            {saved.length > 0 ? "（未保存）" : ""}
-          </option>
+          {saved.length === 0 && <option value="">— 没有数据源 —</option>}
           {saved.map((c) => (
             <option key={c.id} value={c.id}>
               {c.name} · {c.host}:{c.port}
             </option>
           ))}
-          <option value="__manage__">＋ 管理数据源…</option>
         </select>
-        {testResult?.ok && (
-          <Badge tone="ok">
-            <span className="whitespace-nowrap">v{testResult.version}</span>
-          </Badge>
-        )}
-        <button
-          type="button"
-          data-testid={`${side}-toggle-conn`}
-          onClick={() => setShowConn((v) => !v)}
-          className="shrink-0 rounded px-1.5 py-0.5 text-[11px] text-[var(--color-muted)] hover:bg-[#222733] hover:text-[var(--color-text)]"
-        >
-          {showConn ? "收起" : "编辑"}
-        </button>
       </div>
-
-      {/* 连接表单（按需展开） */}
-      {showConn && (
-        <div className="shrink-0 space-y-2 border-b border-[var(--color-border)] bg-[var(--color-panel)] p-3">
-          <div className="grid grid-cols-[1fr_74px] gap-2">
-            <input
-              data-testid={`${side}-host`}
-              value={conn.host}
-              onChange={(e) => set("host", e.target.value)}
-              placeholder="127.0.0.1"
-              spellCheck={false}
-              className="!text-[12px]"
-            />
-            <input
-              data-testid={`${side}-port`}
-              type="number"
-              value={conn.port}
-              onChange={(e) => set("port", Number(e.target.value) || 3306)}
-              className="!text-[12px]"
-            />
-          </div>
-          <div className="grid grid-cols-2 gap-2">
-            <input
-              value={conn.username}
-              onChange={(e) => set("username", e.target.value)}
-              placeholder="用户名"
-              spellCheck={false}
-              className="!text-[12px]"
-            />
-            <input
-              data-testid={`${side}-password`}
-              type="password"
-              value={conn.password ?? ""}
-              onChange={(e) => set("password", e.target.value)}
-              placeholder={conn.passwordSaved ? "已保存" : "密码"}
-              className="!text-[12px]"
-            />
-          </div>
-          <Button
-            onClick={handleTest}
-            disabled={testing}
-            className="w-full"
-            testid={`${side}-test`}
-          >
-            {testing && <Spinner />}
-            {testing ? "连接中…" : "测试并连接"}
-          </Button>
-
-          {/* 保存为数据源 */}
-          <div className="flex items-center gap-1.5">
-            <input
-              data-testid={`${side}-conn-name`}
-              value={connName}
-              onChange={(e) => setConnName(e.target.value)}
-              placeholder="数据源名称，如 生产库只读"
-              spellCheck={false}
-              className="min-w-0 flex-1 !py-1 !text-[11.5px]"
-            />
-            <Button
-              onClick={handleSave}
-              disabled={saving || !testResult?.ok}
-              className="!py-1 !text-[11.5px]"
-              testid={`${side}-save-conn`}
-              title={testResult?.ok ? "保存到本地" : "先测试连接成功再保存"}
-            >
-              {saving ? <Spinner /> : null}
-              {saved.some((c) => c.id === conn.id) ? "更新" : "保存"}
-            </Button>
-            {saved.some((c) => c.id === conn.id) && (
-              <button
-                type="button"
-                onClick={() => onDeleteSaved(conn.id)}
-                className="shrink-0 rounded px-1.5 py-1 text-[11px] text-[var(--color-muted)] hover:text-[var(--color-err)]"
-                title="从列表删除这个数据源"
-              >
-                删除
-              </button>
-            )}
-          </div>
-
-          {testResult && !testResult.ok && (
-            <div className="break-words rounded border border-[#5c2a2f] bg-[#2a1619] px-2 py-1.5 text-[11.5px] text-[var(--color-err)]">
-              {testResult.error}
-            </div>
-          )}
-        </div>
-      )}
 
       {/* 库选择 */}
       <div className="flex shrink-0 items-center gap-2 border-b border-[var(--color-border)] bg-[var(--color-panel-2)] px-3 py-2">
@@ -335,37 +167,55 @@ export function TablePane({
               </div>
             )}
             {visible.map((t) => {
-              const bad = !!t.unsupported_reason || t.is_view;
+              // 行状态机：
+              //   快路径已置灰（复合/无主键/视图）→ 不可勾
+              //   勾选后异步校验中 → 禁用 + 「校验中」
+              //   校验完：整型单列主键 → 可同步；否则自动取消勾选 + 红字原因
+              const fastBad = !!t.unsupported_reason || t.is_view;
+              const v = validated[t.name];
+              const vBad = !!v?.unsupported_reason;
+              const inCheck = validating.has(t.name);
               return (
                 <div
                   key={t.name}
-                  title={t.unsupported_reason ?? undefined}
+                  title={vBad ? (v?.unsupported_reason ?? undefined) : (t.unsupported_reason ?? undefined)}
                   className={cn(
                     "flex items-center gap-2 px-3 py-[3.5px] text-[12px]",
-                    bad && "opacity-40",
-                    !bad && "hover:bg-[#1a1e27]",
-                    selected.has(t.name) && !bad && "bg-[#17233a]",
+                    fastBad && "opacity-40",
+                    !fastBad && "hover:bg-[#1a1e27]",
+                    selected.has(t.name) && !fastBad && "bg-[#17233a]",
                   )}
                 >
                   <input
                     type="checkbox"
                     data-testid={`table-${t.name}`}
                     checked={selected.has(t.name)}
-                    disabled={bad || disabled}
+                    disabled={fastBad || inCheck || disabled}
                     onChange={() => onToggle(t.name)}
                     className="h-3.5 w-3.5 shrink-0 accent-[var(--color-accent)]"
                   />
                   <span className="truncate">{t.name}</span>
                   <span className="ml-auto flex shrink-0 items-center gap-1.5 text-[10px]">
-                    {bad ? (
+                    {fastBad ? (
                       <span className="text-[var(--color-err)]">
                         {t.is_view ? "视图" : "不支持"}
+                      </span>
+                    ) : inCheck ? (
+                      <span className="text-[var(--color-accent)]">校验中…</span>
+                    ) : vBad ? (
+                      <span className="text-[var(--color-err)]">
+                        {v?.unsupported_reason?.includes("复合") ? "复合主键" : "不支持"}
                       </span>
                     ) : (
                       <>
                         {t.primary_key && (
                           <span className="text-[var(--color-dim,#5c6478)]">
                             {t.primary_key}
+                          </span>
+                        )}
+                        {v?.max_pk != null && (
+                          <span className="text-[#5c6478]" title="源 MAX(pk)">
+                            max {formatInt(v.max_pk)}
                           </span>
                         )}
                         <span className="text-[#5c6478]">{formatInt(t.rows_estimate)}</span>
