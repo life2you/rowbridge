@@ -447,6 +447,20 @@ async fn sync_one(
     let packet = introspect::max_allowed_packet(&mut dst).await?;
     let budget = (packet as f64 * PACKET_BUDGET_RATIO) as u64;
 
+    // 按往返延迟挑初始批大小。远程库 RTT 高，从 1000 起步再慢慢放大，
+    // 光爬升阶段就要浪费几十次往返；直接按延迟给个合理起点。
+    let initial_batch = {
+        let t0 = Instant::now();
+        let _ = src.query_drop("SELECT 1").await;
+        let rtt_ms = t0.elapsed().as_secs_f64() * 1000.0;
+        match rtt_ms {
+            r if r < 2.0 => opts.batch_size.max(2000),
+            r if r < 10.0 => opts.batch_size.max(2000),
+            r if r < 30.0 => opts.batch_size.max(5000),
+            _ => opts.batch_size.max(10000),
+        }
+    };
+
     // 每张表有自己的游标：表级配置优先，没有则回落到全局。
     let eff_cursor_start = table_cfg.effective_cursor_start(opts);
     let eff_start_id = table_cfg
@@ -509,7 +523,7 @@ async fn sync_one(
         cursor,
         end_id,
         end_pk,
-        batch_size: opts.batch_size.clamp(MIN_BATCH, opts.max_batch_size.max(MIN_BATCH)),
+        batch_size: initial_batch.clamp(MIN_BATCH, opts.max_batch_size.max(MIN_BATCH)),
         src_schema: pf.source_schema.clone(),
         dst_schema: pf.target_schema.clone(),
         src_table: pf.table.clone(),
@@ -602,13 +616,21 @@ async fn sync_one(
         };
 
         if opts.adaptive_batch {
-            let ms = elapsed.as_millis() as u64;
+            // 每批只翻一倍的话，batch=1000 要到 1 万需要 4 批（含 4 次网络往返），
+            // 远程库上这几批的代价不小。这里按「每批约 300ms」的目标直接算出
+            // 合适的批大小，一步到位；之后只用小幅微调。
+            let ms = elapsed.as_millis().max(1) as f64;
             let cap = opts.max_batch_size.min(placeholder_cap);
-            if ms < 200 {
-                run.batch_size = (run.batch_size * 2).min(cap);
-            } else if ms > 2000 {
-                run.batch_size = (run.batch_size / 2).max(MIN_BATCH);
-            }
+            let target = if ms < 300.0 {
+                // 按当前吞吐外推：这一批用 ms 毫秒处理了 returned 行，
+                // 想让它涨到 300ms，行数应放大 300/ms 倍。
+                ((returned as f64) * (300.0 / ms)).ceil() as usize
+            } else if ms > 1000.0 {
+                ((returned as f64) * (300.0 / ms)).floor() as usize
+            } else {
+                run.batch_size
+            };
+            run.batch_size = target.clamp(MIN_BATCH, cap);
         }
 
         sink.emit(Event::BatchDone {
@@ -794,16 +816,14 @@ async fn write_batch(
         }
     };
 
-    dst.query_drop("START TRANSACTION").await?;
+    // 一条语句完成「开事务 + 写入 + 提交」，把每批 3 次往返压成 1 次。
+    // 远程库上 RTT 是主要成本，这一下能省掉 2/3 的写侧往返。
+    //
+    // 注意：MySQL 的 autocommit 默认开启，单条语句本身就是原子的，
+    // 所以这里其实不需要显式事务 —— 之前每批发 START/COMMIT 是多余的开销。
     match dst.exec_drop(sql, Params::Positional(params)).await {
-        Ok(()) => {
-            dst.query_drop("COMMIT").await?;
-            Ok(())
-        }
-        Err(e) => {
-            let _ = dst.query_drop("ROLLBACK").await;
-            Err(e.into())
-        }
+        Ok(()) => Ok(()),
+        Err(e) => Err(e.into()),
     }
 }
 
