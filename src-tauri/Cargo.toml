@@ -1,0 +1,26 @@
+[package]
+name = "rowbridge"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "RowBridge — MySQL 可视化同步工具"
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri = { version = "2", features = [] }
+tauri-plugin-opener = "2"
+tauri-plugin-dialog = "2"
+rowbridge-core = { path = "../crates/rowbridge-core" }
+mysql_async = { workspace = true }
+tokio = { workspace = true }
+tokio-util = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+keyring = "4"
+rusqlite = { version = "0.40", features = ["bundled"] }
+
+[lib]
+name = "rowbridge_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]

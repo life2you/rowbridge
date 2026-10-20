@@ -1,0 +1,71 @@
+@import "tailwindcss";
+
+@theme {
+  --color-bg: #0f1115;
+  --color-panel: #171a21;
+  --color-panel-2: #1e222b;
+  --color-border: #2a2f3a;
+  --color-text: #e6e9ef;
+  --color-muted: #8b94a7;
+  --color-accent: #4f8cff;
+  --color-ok: #3fb950;
+  --color-warn: #d29922;
+  --color-err: #f85149;
+}
+
+html,
+body,
+#root {
+  height: 100%;
+  margin: 0;
+}
+
+body {
+  background: var(--color-bg);
+  color: var(--color-text);
+  font-family: -apple-system, BlinkMacSystemFont, "SF Pro Text", "PingFang SC",
+    "Helvetica Neue", sans-serif;
+  font-size: 13px;
+  -webkit-font-smoothing: antialiased;
+}
+
+code,
+pre,
+.mono {
+  font-family: "SF Mono", ui-monospace, Menlo, monospace;
+  font-size: 12px;
+}
+
+::-webkit-scrollbar {
+  width: 10px;
+  height: 10px;
+}
+::-webkit-scrollbar-thumb {
+  background: #333a47;
+  border-radius: 5px;
+  border: 2px solid var(--color-bg);
+}
+::-webkit-scrollbar-thumb:hover {
+  background: #444d5e;
+}
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+input,
+select {
+  background: var(--color-panel-2);
+  border: 1px solid var(--color-border);
+  border-radius: 6px;
+  padding: 6px 9px;
+  color: var(--color-text);
+  outline: none;
+  font-size: 13px;
+}
+input:focus,
+select:focus {
+  border-color: var(--color-accent);
+}
+input::placeholder {
+  color: #5c6478;
+}

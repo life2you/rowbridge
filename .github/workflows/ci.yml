@@ -1,0 +1,62 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: 单元测试
+        run: cargo test -p rowbridge-core --all-targets
+
+      - name: 前端类型检查与构建
+        run: |
+          npm ci
+          npm run build
+
+      - name: 端到端测试
+        run: ./tests/e2e/run.sh
+
+  build:
+    needs: test
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: 安装依赖
+        run: npm ci
+
+      - name: 构建应用（不打包 dmg，CI 里无 GUI 会卡在 Finder AppleScript）
+        run: npm run tauri build -- --no-bundle
+
+      - name: 手动生成 dmg
+        run: |
+          APP=target/release/bundle/macos/RowBridge.app
+          STAGE=$(mktemp -d)
+          cp -R "$APP" "$STAGE/"
+          ln -s /Applications "$STAGE/Applications"
+          hdiutil create -volname RowBridge -srcfolder "$STAGE" -ov -format UDZO \
+            target/release/RowBridge_aarch64.dmg
+          rm -rf "$STAGE"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: RowBridge-dmg
+          path: target/release/RowBridge_*.dmg

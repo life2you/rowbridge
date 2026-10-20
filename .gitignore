@@ -1,0 +1,15 @@
+# Rust
+/target
+**/*.rs.bk
+
+# Node
+node_modules
+dist
+dist-ssr
+*.local
+
+# macOS
+.DS_Store
+
+# Tauri
+src-tauri/gen/schemas

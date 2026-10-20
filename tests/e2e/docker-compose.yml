@@ -1,0 +1,30 @@
+services:
+  mysql-src:
+    image: mysql:8.0
+    container_name: rowbridge-src
+    environment:
+      MYSQL_ROOT_PASSWORD: root123
+      MYSQL_DATABASE: db_a
+    ports:
+      - "3307:3306"
+    command: --max-allowed-packet=64M --character-set-server=utf8mb4 --collation-server=utf8mb4_0900_ai_ci
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "127.0.0.1", "-uroot", "-proot123"]
+      interval: 3s
+      timeout: 3s
+      retries: 30
+
+  mysql-dst:
+    image: mysql:8.0
+    container_name: rowbridge-dst
+    environment:
+      MYSQL_ROOT_PASSWORD: root123
+      MYSQL_DATABASE: db_b
+    ports:
+      - "3308:3306"
+    command: --max-allowed-packet=64M --character-set-server=utf8mb4 --collation-server=utf8mb4_0900_ai_ci
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "127.0.0.1", "-uroot", "-proot123"]
+      interval: 3s
+      timeout: 3s
+      retries: 30

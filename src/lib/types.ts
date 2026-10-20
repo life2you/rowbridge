@@ -1,0 +1,200 @@
+/** 与 Rust 侧 commands.rs 对应的类型。 */
+
+export type Severity = "error" | "warning" | "info" | "ok";
+
+export interface Check {
+  severity: Severity;
+  code: string;
+  message: string;
+}
+
+export interface RewriteChange {
+  kind: string;
+  detail: string;
+}
+
+export interface RewriteResult {
+  ddl: string;
+  changes: RewriteChange[];
+  warnings: string[];
+}
+
+export interface TablePreflight {
+  source_schema: string;
+  table: string;
+  target_schema: string;
+  target_table: string;
+  syncable: boolean;
+  primary_key: string | null;
+  primary_key_unsigned: boolean;
+  columns: string[];
+  checks: Check[];
+  needs_create_table: boolean;
+  create_table: RewriteResult | null;
+  source_max_pk: string | null;
+  target_max_pk: string | null;
+  source_rows_estimate: number;
+  target_rows_exists: boolean;
+}
+
+export interface PreflightReport {
+  tables: TablePreflight[];
+  source_version: string;
+  target_version: string;
+  same_instance: boolean;
+  checks: Check[];
+}
+
+export interface SchemaInfo {
+  name: string;
+  charset: string | null;
+  collation: string | null;
+}
+
+export interface TableRow {
+  name: string;
+  rows_estimate: number;
+  engine: string | null;
+  primary_key: string | null;
+  unsupported_reason: string | null;
+  is_view: boolean;
+}
+
+export interface ColumnInfo {
+  name: string;
+  data_type: string;
+  column_type: string;
+  is_nullable: boolean;
+  column_default: string | null;
+  extra: string;
+  charset: string | null;
+  collation: string | null;
+  is_primary: boolean;
+}
+
+export interface TableDetail {
+  schema: string;
+  table: string;
+  columns: ColumnInfo[];
+  primary_key: string[];
+  triggers: string[];
+}
+
+export interface ConnForm {
+  host: string;
+  port: number;
+  username: string;
+  password?: string | null;
+  connection_id?: string | null;
+  use_tls?: boolean;
+}
+
+export interface TestResult {
+  version: string;
+  is_mariadb: boolean;
+  schemas: number;
+}
+
+export interface OptionsForm {
+  parallelism: number;
+  batch_size: number;
+  max_batch_size: number;
+  adaptive_batch: boolean;
+  cursor_start: "full" | "resume" | "custom";
+  start_id?: string | null;
+  end_id?: string | null;
+  create_table: boolean;
+  create_database: boolean;
+  strip_foreign_keys: boolean;
+  strip_auto_increment: boolean;
+  map_collation: boolean;
+  disable_foreign_key_checks: boolean;
+  relax_sql_mode: boolean;
+  continue_on_error: boolean;
+}
+
+export interface TableSpec {
+  table: string;
+  dst_table?: string | null;
+}
+
+export interface RunRequest {
+  source: ConnForm;
+  target: ConnForm;
+  src_schema: string;
+  dst_schema: string;
+  tables: TableSpec[];
+  options: OptionsForm;
+}
+
+export type SyncEvent =
+  | { type: "task_started"; tables: number }
+  | { type: "table_started"; table: string; columns: number; needs_create_table: boolean }
+  | { type: "table_created"; table: string; ddl: string }
+  | {
+      type: "batch_done";
+      table: string;
+      rows: number;
+      total_rows: number;
+      cursor: string;
+      rows_per_sec: number;
+      batch_size: number;
+      elapsed_ms: number;
+    }
+  | { type: "table_done"; table: string; rows: number; elapsed_ms: number }
+  | { type: "table_failed"; table: string; error: string }
+  | { type: "warning"; table: string | null; message: string }
+  | { type: "log"; table: string | null; level: string; message: string }
+  | { type: "task_done"; total_rows: number; succeeded: number; failed: number; elapsed_ms: number }
+  | { type: "cancelled" };
+
+export interface TableStats {
+  table: string;
+  rows: number;
+  batches: number;
+  cursor: string;
+  elapsed_ms: number;
+  status: "running" | "done" | "failed" | "cancelled";
+  error: string | null;
+}
+
+export interface TaskReport {
+  tables: TableStats[];
+  total_rows: number;
+  succeeded: number;
+  failed: number;
+  /** 因取消停在半路的表：既没跑完也没报错 */
+  partial: number;
+  elapsed_ms: number;
+  cancelled: boolean;
+}
+
+export interface TaskSummary {
+  id: string;
+  src: string;
+  dst: string;
+  status: string;
+  total_rows: number;
+  succeeded: number;
+  failed: number;
+  elapsed_ms: number;
+  started_at: number;
+  finished_at: number | null;
+  error: string | null;
+}
+
+export interface LogRow {
+  ts: number;
+  level: string;
+  table_name: string | null;
+  message: string;
+}
+
+/** 一张表在整个 UI 流程中的状态。 */
+export interface TableSelection {
+  name: string;
+  rows_estimate: number;
+  primary_key: string | null;
+  unsupported_reason: string | null;
+  selected: boolean;
+}
