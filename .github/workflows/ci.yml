@@ -48,9 +48,15 @@ jobs:
       - name: 构建应用（不打包 dmg，CI 里无 GUI 会卡在 Finder AppleScript）
         run: npm run tauri build -- --no-bundle
 
+      # --no-bundle 只产出二进制，不生成 .app；这里手工组装
       - name: 手动生成 dmg
         run: |
           APP=target/release/bundle/macos/RowBridge.app
+          mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
+          cp target/release/rowbridge "$APP/Contents/MacOS/rowbridge"
+          cp src-tauri/icons/icon.icns "$APP/Contents/Resources/icon.icns"
+          cp src-tauri/Info.plist "$APP/Contents/Info.plist"
+          codesign --force --deep --sign - "$APP"
           STAGE=$(mktemp -d)
           cp -R "$APP" "$STAGE/"
           ln -s /Applications "$STAGE/Applications"
