@@ -124,12 +124,27 @@ pub async fn list_tables(
     for t in tables {
         // 每张表都取一次主键，用于列表上的「可同步/不支持」标记。
         let detail = introspect::table_detail(&mut conn, &schema, &t.name).await.ok();
-        let (pk, reason) = match &detail {
+        let (pk, reason, max_pk) = match &detail {
             Some(d) => match d.pk_column() {
-                Ok(col) => (Some(col.name.clone()), None),
-                Err(e) => (d.primary_key.first().cloned(), Some(e.to_string())),
+                Ok(col) => {
+                    // 只有整型主键才能直接转 u64
+                    let max: Option<u64> = mysql_async::prelude::Queryable::query_first::<Option<u64>, _>(
+                        &mut conn,
+                        format!(
+                            "SELECT MAX({}) FROM {}",
+                            rowbridge_core::value::quote_ident(&col.name),
+                            rowbridge_core::value::qualified(&schema, &t.name)
+                        ),
+                    )
+                    .await
+                    .ok()
+                    .flatten()
+                    .flatten();
+                    (Some(col.name.clone()), None, max)
+                }
+                Err(e) => (d.primary_key.first().cloned(), Some(e.to_string()), None),
             },
-            None => (None, Some("读取表结构失败".into())),
+            None => (None, Some("读取表结构失败".into()), None),
         };
         out.push(TableRow {
             name: t.name,
@@ -141,6 +156,7 @@ pub async fn list_tables(
                 .table_type
                 .map(|ty| ty.eq_ignore_ascii_case("VIEW"))
                 .unwrap_or(false),
+            max_pk,
         });
     }
     let _ = conn.disconnect().await;
@@ -155,6 +171,8 @@ pub struct TableRow {
     pub primary_key: Option<String>,
     pub unsupported_reason: Option<String>,
     pub is_view: bool,
+    /// 主键最大值。逐表游标要靠它做区间行数估算，没有它就只能是瞎猜。
+    pub max_pk: Option<u64>,
 }
 
 /// 读取表结构，用于详情面板。
@@ -183,6 +201,13 @@ pub struct TableSpec {
     /// 目标表名，留空表示同名
     #[serde(default)]
     pub dst_table: Option<String>,
+    /// 表级游标模式；不传则跟随全局
+    #[serde(default)]
+    pub cursor_start: Option<String>,
+    #[serde(default)]
+    pub start_id: Option<String>,
+    #[serde(default)]
+    pub end_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -301,6 +326,14 @@ fn to_task_config(req: &RunRequest) -> Result<TaskConfig, String> {
             dst_schema: req.dst_schema.clone(),
             dst_table: t.dst_table.clone().filter(|s| !s.is_empty()),
             columns: Vec::new(),
+            cursor_start: t.cursor_start.as_deref().and_then(|s| match s {
+                "full" => Some(CursorStart::Full),
+                "resume" => Some(CursorStart::Resume),
+                "custom" => Some(CursorStart::Custom),
+                _ => None,
+            }),
+            start_id: t.start_id.clone(),
+            end_id: t.end_id.clone(),
         })
         .collect();
     Ok(TaskConfig {

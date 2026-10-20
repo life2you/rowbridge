@@ -35,6 +35,9 @@ export interface TablePreflight {
   target_max_pk: string | null;
   source_rows_estimate: number;
   target_rows_exists: boolean;
+  cursor_start: CursorMode;
+  start_id: string | null;
+  end_id: string | null;
 }
 
 export interface PreflightReport {
@@ -58,6 +61,8 @@ export interface TableRow {
   primary_key: string | null;
   unsupported_reason: string | null;
   is_view: boolean;
+  /** 主键最大值，逐表游标做区间行数估算用 */
+  max_pk: number | null;
 }
 
 export interface ColumnInfo {
@@ -113,9 +118,22 @@ export interface OptionsForm {
   continue_on_error: boolean;
 }
 
+export type CursorMode = "full" | "resume" | "custom";
+
 export interface TableSpec {
   table: string;
   dst_table?: string | null;
+  /** 表级游标；不传则跟随全局 */
+  cursor_start?: CursorMode | null;
+  start_id?: string | null;
+  end_id?: string | null;
+}
+
+/** 每张表的游标覆写（空字符串表示「不限」） */
+export interface CursorOverride {
+  cursor_start?: CursorMode | null;
+  start_id?: string | null;
+  end_id?: string | null;
 }
 
 export interface RunRequest {

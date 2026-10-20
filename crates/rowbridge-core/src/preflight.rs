@@ -68,6 +68,12 @@ pub struct TablePreflight {
     pub target_max_pk: Option<String>,
     pub source_rows_estimate: u64,
     pub target_rows_exists: bool,
+    /// 本表生效的游标模式（表级优先，其次全局）
+    pub cursor_start: crate::config::CursorStart,
+    /// 本表生效的起始 id
+    pub start_id: Option<String>,
+    /// 本表生效的结束 id
+    pub end_id: Option<String>,
 }
 
 impl TablePreflight {
@@ -367,6 +373,46 @@ async fn check_table(
         create_table = None;
     }
 
+    let cursor_start = task.effective_cursor_start(options);
+    let start_id = task
+        .effective_start_id(options)
+        .filter(|s| !s.trim().is_empty());
+    let end_id = task
+        .effective_end_id(options)
+        .filter(|s| !s.trim().is_empty());
+
+    // 自定义游标填错了会静默同步 0 行，这里提前点破。
+    if cursor_start == crate::config::CursorStart::Custom {
+        match &start_id {
+            None => checks.push(Check::warn(
+                "cursor_custom_empty",
+                "选了自定义游标但没填起始 id，将等同全量",
+            )),
+            Some(v) => {
+                if let Ok(maxv) = v.parse::<i128>() {
+                    if let Some(src_max) = source_max_pk.as_ref().and_then(|m| m.parse::<i128>().ok()) {
+                        if maxv >= src_max {
+                            checks.push(Check::error(
+                                "cursor_beyond_max",
+                                format!(
+                                    "起始 id {maxv} 已不小于源表 MAX(pk) {src_max}，本表将同步 0 行"
+                                ),
+                            ));
+                        }
+                    }
+                    if let Some(endv) = end_id.as_ref().and_then(|e| e.parse::<i128>().ok()) {
+                        if endv <= maxv {
+                            checks.push(Check::error(
+                                "cursor_empty_range",
+                                format!("结束 id {endv} 不大于起始 id {maxv}，区间为空"),
+                            ));
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     Ok(TablePreflight {
         source_schema: task.src_schema.clone(),
         table: task.table.clone(),
@@ -383,6 +429,9 @@ async fn check_table(
         target_max_pk,
         source_rows_estimate: src_rows_estimate,
         target_rows_exists,
+        cursor_start,
+        start_id,
+        end_id,
     })
 }
 

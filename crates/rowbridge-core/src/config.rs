@@ -113,6 +113,43 @@ pub struct TableTaskConfig {
     /// 要同步的列；为空表示源表全部列
     #[serde(default)]
     pub columns: Vec<String>,
+
+    /// 本表独立的游标模式；None 表示跟随全局 TaskOptions。
+    #[serde(default)]
+    pub cursor_start: Option<CursorStart>,
+    /// 本表独立的起始 id（cursor_start 解析为 Custom 时生效）
+    #[serde(default)]
+    pub start_id: Option<String>,
+    /// 本表独立的结束 id（含）
+    #[serde(default)]
+    pub end_id: Option<String>,
+}
+
+impl TableTaskConfig {
+    /// 解析本表实际生效的游标模式：表级优先，其次全局。
+    pub fn effective_cursor_start(&self, global: &TaskOptions) -> CursorStart {
+        self.cursor_start.unwrap_or(global.cursor_start)
+    }
+
+    /// 解析本表实际生效的起始 id。
+    ///
+    /// 表级显式设了就用表级（包括设成空串表示「不限」）；
+    /// 否则回落到全局。返回 owned 值是为了避开两个来源的生命周期纠缠。
+    pub fn effective_start_id(&self, global: &TaskOptions) -> Option<String> {
+        self.start_id
+            .clone()
+            .or_else(|| global.start_id.clone())
+    }
+
+    /// 解析本表实际生效的结束 id。
+    pub fn effective_end_id(&self, global: &TaskOptions) -> Option<String> {
+        self.end_id.clone().or_else(|| global.end_id.clone())
+    }
+
+    /// 是否有表级游标覆盖。
+    pub fn has_cursor_override(&self) -> bool {
+        self.cursor_start.is_some() || self.start_id.is_some() || self.end_id.is_some()
+    }
 }
 
 impl TableTaskConfig {
@@ -259,6 +296,60 @@ mod tests {
         };
         let url = c.to_url().unwrap();
         assert_eq!(url.db_name(), Some("db_a"));
+    }
+
+    fn task(table: &str, cs: Option<CursorStart>, start: Option<&str>, end: Option<&str>) -> TableTaskConfig {
+        TableTaskConfig {
+            table: table.into(),
+            src_schema: "db_a".into(),
+            dst_schema: "db_b".into(),
+            dst_table: None,
+            columns: Vec::new(),
+            cursor_start: cs,
+            start_id: start.map(|s| s.to_string()),
+            end_id: end.map(|s| s.to_string()),
+        }
+    }
+
+    #[test]
+    fn table_cursor_overrides_global() {
+        let global = TaskOptions {
+            cursor_start: CursorStart::Full,
+            start_id: Some("100".into()),
+            end_id: Some("200".into()),
+            ..Default::default()
+        };
+        let t = task("a", Some(CursorStart::Custom), Some("500"), Some("900"));
+        assert_eq!(t.effective_cursor_start(&global), CursorStart::Custom);
+        assert_eq!(t.effective_start_id(&global).as_deref(), Some("500"));
+        assert_eq!(t.effective_end_id(&global).as_deref(), Some("900"));
+        assert!(t.has_cursor_override());
+    }
+
+    #[test]
+    fn table_without_override_follows_global() {
+        let global = TaskOptions {
+            cursor_start: CursorStart::Resume,
+            start_id: None,
+            end_id: Some("200".into()),
+            ..Default::default()
+        };
+        let t = task("a", None, None, None);
+        assert_eq!(t.effective_cursor_start(&global), CursorStart::Resume);
+        assert_eq!(t.effective_end_id(&global).as_deref(), Some("200"));
+        assert!(!t.has_cursor_override());
+    }
+
+    #[test]
+    fn empty_table_end_id_means_unlimited_not_fallback() {
+        // 表级显式设成空串 = 「不限」，不能被全局的 end_id 顶掉，
+        // 否则用户清空某一行的结束 id 会莫名其妙地又用上全局值。
+        let global = TaskOptions {
+            end_id: Some("200".into()),
+            ..Default::default()
+        };
+        let t = task("a", None, None, Some(""));
+        assert_eq!(t.effective_end_id(&global).as_deref(), Some(""));
     }
 
     #[test]

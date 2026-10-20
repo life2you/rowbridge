@@ -1,0 +1,205 @@
+<!doctype html>
+<html lang="zh-CN"><head><meta charset="utf-8"><link rel="stylesheet" href="base.css">
+<style>
+  body { display: flex; flex-direction: column; }
+  .top { height: 44px; display: flex; align-items: center; gap: 10px; padding: 0 12px 0 78px; border-bottom: 1px solid var(--border); background: var(--panel); flex-shrink: 0; }
+  .cols { flex: 1; display: flex; min-height: 0; }
+
+  .src { width: 232px; flex-shrink: 0; display: flex; flex-direction: column; border-right: 1px solid var(--border); }
+  .pane-head { display: flex; align-items: center; gap: 6px; padding: 7px 10px; border-bottom: 1px solid var(--border); }
+  .dot { width: 7px; height: 7px; border-radius: 50%; }
+  .dbrow { display: flex; align-items: center; gap: 6px; padding: 6px 10px; background: var(--panel2); border-bottom: 1px solid var(--border); }
+  .dbrow select { flex: 1; font-size: 12px; font-weight: 600; }
+  .list { flex: 1; overflow-y: auto; }
+  .row { display: flex; align-items: center; gap: 6px; padding: 3.5px 10px; font-size: 12px; }
+  .row:hover { background: #1a1e27; }
+  .row.pick { background: #17233a; }
+  .row.off { opacity: .4; }
+  .nm { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .meta { margin-left: auto; font-size: 10px; color: var(--dim); flex-shrink: 0; }
+  .mark { color: var(--accent); font-size: 9px; flex-shrink: 0; }
+
+  /* —— 方案 G 的核心：右侧单表详情面板 —— */
+  .detail { flex: 1; min-width: 0; display: flex; flex-direction: column; }
+  .detail-head { display: flex; align-items: center; gap: 9px; padding: 8px 14px; border-bottom: 1px solid var(--border); background: var(--panel); flex-shrink: 0; }
+  .detail-head h2 { font-size: 14px; font-weight: 600; }
+  .detail-body { flex: 1; overflow-y: auto; padding: 14px; display: grid; grid-template-columns: 1fr 1fr; gap: 14px; align-content: start; }
+
+  .card { border: 1px solid var(--border); border-radius: 8px; background: var(--panel); overflow: hidden; }
+  .card-head { padding: 7px 11px; border-bottom: 1px solid var(--border); font-size: 10.5px; text-transform: uppercase; letter-spacing: .4px; color: var(--muted); font-weight: 600; display: flex; align-items: center; gap: 6px; }
+  .card-body { padding: 10px 11px; }
+
+  .kvs { display: flex; flex-direction: column; gap: 7px; }
+  .kv { display: flex; align-items: center; justify-content: space-between; font-size: 11.5px; }
+  .kv span { color: var(--muted); }
+  .kv b { font-family: "SF Mono", monospace; font-size: 11px; font-weight: 500; }
+
+  .modes { display: flex; flex-direction: column; gap: 6px; }
+  .mode { display: flex; align-items: flex-start; gap: 8px; padding: 7px 9px; border: 1px solid var(--border); border-radius: 6px; cursor: pointer; }
+  .mode:hover { border-color: #3d4553; }
+  .mode.on { border-color: var(--accent); background: #141c2b; }
+  .mode input { margin-top: 2px; }
+  .mode b { display: block; font-size: 11.5px; font-weight: 500; }
+  .mode i { display: block; font-style: normal; font-size: 10px; color: var(--dim); margin-top: 1px; line-height: 1.4; }
+
+  .range { display: flex; flex-direction: column; gap: 8px; }
+  .range .line { display: flex; align-items: center; gap: 8px; }
+  .range label { font-size: 10.5px; color: var(--muted); width: 46px; flex-shrink: 0; }
+  .range input { flex: 1; font-size: 12px; }
+  .range .hint { font-size: 10px; color: var(--dim); }
+
+  .result { background: #101419; border: 1px solid #22303f; border-radius: 6px; padding: 9px 11px; margin-top: 9px; }
+  .result .big { font-size: 22px; font-weight: 600; color: var(--accent); font-family: "SF Mono", monospace; letter-spacing: -.5px; }
+  .result .lbl { font-size: 10px; color: var(--muted); }
+  .result .warn { font-size: 10.5px; color: var(--warn); margin-top: 5px; display: flex; gap: 5px; }
+
+  .footbar { flex-shrink: 0; display: flex; align-items: center; gap: 10px; padding: 8px 14px; border-top: 1px solid var(--border); background: var(--panel); }
+  .sum { font-size: 11px; color: var(--muted); }
+  .sum b { color: var(--text); }
+
+  .secondary { width: 210px; flex-shrink: 0; border-left: 1px solid var(--border); background: #12151b; display: flex; flex-direction: column; }
+  .secondary .pane-head { border-bottom: 1px solid var(--border); }
+  .dst-list { flex: 1; overflow-y: auto; padding: 4px 0; }
+  .dst-row { display: flex; align-items: center; gap: 6px; padding: 4px 10px; font-size: 11.5px; }
+  .dst-row .s { margin-left: auto; font-size: 9.5px; }
+  .badge-sm { font-size: 9px; padding: 0 4px; border-radius: 3px; }
+
+  .drawer { flex-shrink: 0; border-top: 1px solid var(--border); background: var(--panel); }
+  .drawer-head { display: flex; align-items: center; gap: 9px; padding: 6px 12px; font-size: 11px; }
+  .pill { padding: 1px 7px; border-radius: 9px; font-size: 10.5px; background: #242935; color: var(--muted); }
+  .pill.on { background: #17233a; color: var(--accent); }
+</style></head>
+<body>
+  <div class="top">
+    <span style="font-size:13px;font-weight:600">RowBridge</span><span class="brand-sub">MySQL 同步</span>
+    <span class="badge b-ok">预检通过 4</span>
+    <div style="margin-left:auto"><button class="btn btn-ghost btn-sm">历史</button></div>
+  </div>
+
+  <div class="cols">
+    <div class="src">
+      <div class="pane-head"><i class="dot" style="background:var(--accent)"></i><span style="font-size:12px;font-weight:600">源 db_a</span>
+        <button class="btn btn-ghost btn-sm" style="margin-left:auto">切换</button></div>
+      <div class="dbrow"><select><option>db_a</option></select><span class="badge b-ok">18</span></div>
+      <div class="list">
+        <div class="row"><input type="checkbox" class="check"><span class="nm">big_blob</span><span class="meta">2</span></div>
+        <div class="row pick"><input type="checkbox" class="check" checked><span class="nm">big_unsigned</span><span class="meta">4</span></div>
+        <div class="row pick"><input type="checkbox" class="check" checked><span class="nm">bulk</span><span class="meta">10,000</span></div>
+        <div class="row"><input type="checkbox" class="check"><span class="nm">child_t</span><span class="meta">2</span></div>
+        <div class="row off"><input type="checkbox" class="check" disabled><span class="nm">composite_pk</span><span class="meta" style="color:var(--err)">不支持</span></div>
+        <div class="row"><input type="checkbox" class="check"><span class="nm">empty_t</span><span class="meta">0</span></div>
+        <div class="row"><input type="checkbox" class="check"><span class="nm">generated_col</span><span class="meta">2</span></div>
+        <div class="row pick"><input type="checkbox" class="check" checked><span class="nm" style="font-weight:600">huge</span><span class="mark">●</span><span class="meta">494,161</span></div>
+        <div class="row pick"><input type="checkbox" class="check" checked><span class="nm">simple</span><span class="mark">●</span><span class="meta">5</span></div>
+        <div class="row"><input type="checkbox" class="check"><span class="nm">sparse</span><span class="meta">4</span></div>
+        <div class="row off"><input type="checkbox" class="check" disabled><span class="nm">str_pk</span><span class="meta" style="color:var(--err)">不支持</span></div>
+        <div class="row"><input type="checkbox" class="check"><span class="nm">types_all</span><span class="meta">1</span></div>
+        <div class="row"><input type="checkbox" class="check"><span class="nm">wide</span><span class="meta">5</span></div>
+      </div>
+      <div style="padding:6px 10px;border-top:1px solid var(--border);font-size:10.5px;color:var(--muted)">
+        已选 <b style="color:var(--text)">4</b> · <span style="color:var(--accent)">●</span> 2 张已设游标
+      </div>
+    </div>
+
+    <div class="detail">
+      <div class="detail-head">
+        <h2>huge</h2>
+        <span class="badge b-muted">主键 id</span>
+        <span style="font-size:11px;color:var(--muted)">db_a → db_b</span>
+        <div style="margin-left:auto;display:flex;gap:7px">
+          <button class="btn btn-sm">跟随全局</button>
+          <button class="btn btn-sm">预检</button>
+          <button class="btn btn-sm" style="background:var(--accent);border-color:transparent;color:#fff">开始同步</button>
+        </div>
+      </div>
+
+      <div class="detail-body">
+        <div class="card">
+          <div class="card-head">表信息</div>
+          <div class="card-body">
+            <div class="kvs">
+              <div class="kv"><span>主键类型</span><b>bigint unsigned</b></div>
+              <div class="kv"><span>源表行数</span><b>494,161</b></div>
+              <div class="kv"><span>源 MAX(id)</span><b>500,000</b></div>
+              <div class="kv"><span>目标 MAX(id)</span><b style="color:var(--dim)">—（空表）</b></div>
+              <div class="kv"><span>目标表</span><b style="color:var(--accent)">将新建</b></div>
+            </div>
+          </div>
+        </div>
+
+        <div class="card">
+          <div class="card-head">游标模式 <span style="margin-left:auto;font-size:9px;color:var(--dim);text-transform:none;letter-spacing:0">仅影响本表</span></div>
+          <div class="card-body">
+            <div class="modes">
+              <label class="mode on"><input type="radio" name="m" checked><div><b>自定义区间</b><i>从指定 id 开始，到指定 id 结束</i></div></label>
+              <label class="mode"><input type="radio" name="m"><div><b>全量</b><i>从头同步整张表</i></div></label>
+              <label class="mode"><input type="radio" name="m"><div><b>续传</b><i>从目标表 MAX(id) 之后继续</i></div></label>
+              <label class="mode"><input type="radio" name="m"><div><b>跟随全局</b><i>使用中间栏的全局设置</i></div></label>
+            </div>
+          </div>
+        </div>
+
+        <div class="card" style="grid-column:1/-1">
+          <div class="card-head">同步区间</div>
+          <div class="card-body">
+            <div class="range">
+              <div class="line"><label>起始 id</label><input value="100000">
+                <span class="hint">不含此行，从 100001 开始</span></div>
+              <div class="line"><label>结束 id</label><input value="200000" placeholder="不限（同步到最后）">
+                <span class="hint">含此行</span></div>
+            </div>
+            <div class="result">
+              <div style="display:flex;align-items:baseline;gap:10px">
+                <div class="big">100,001</div>
+                <div class="lvl"><div class="lbl">预计同步行数</div>
+                  <div style="font-size:10px;color:var(--dim)">按主键区间估算，实际以预检为准</div></div>
+              </div>
+              <div class="warn">⚠ 结束 id 200000 小于源 MAX 500000，200001 之后的行不会被同步</div>
+            </div>
+          </div>
+        </div>
+
+        <div class="card" style="grid-column:1/-1">
+          <div class="card-head">其他已选表 <span style="margin-left:auto;font-size:9px;color:var(--dim);text-transform:none;letter-spacing:0">点一行切换</span></div>
+          <div style="padding:2px 0">
+            <div class="dst-row"><span class="nm">bulk</span><span style="color:var(--dim);font-size:10px">跟随全局</span><span class="s" style="color:var(--muted)">10,001 行</span></div>
+            <div class="dst-row" style="background:#17233a"><span class="nm">simple</span><span style="color:var(--accent);font-size:10px">id &gt; 3</span><span class="s" style="color:var(--accent)">2 行</span></div>
+            <div class="dst-row"><span class="nm">big_unsigned</span><span style="color:var(--dim);font-size:10px">跟随全局</span><span class="s" style="color:var(--muted)">4 行</span></div>
+          </div>
+        </div>
+      </div>
+
+      <div class="footbar">
+        <span class="sum">预计同步 <b>110,018</b> 行 · 2 张自定义 · 2 张跟随全局</span>
+        <div style="margin-left:auto;display:flex;gap:7px;align-items:center">
+          <span style="font-size:10.5px;color:var(--muted)">全局</span>
+          <select style="font-size:11px;padding:2px 6px"><option>全量</option><option>续传</option></select>
+          <span style="font-size:10.5px;color:var(--muted)">并行</span><input value="2" style="width:42px;font-size:11px;padding:2px 6px">
+          <span style="font-size:10.5px;color:var(--muted)">批</span><input value="1000" style="width:54px;font-size:11px;padding:2px 6px">
+        </div>
+      </div>
+    </div>
+
+    <div class="secondary">
+      <div class="pane-head"><i class="dot" style="background:var(--ok)"></i><span style="font-size:12px;font-weight:600">目标 db_b</span>
+        <button class="btn btn-ghost btn-sm" style="margin-left:auto">切换</button></div>
+      <div class="dbrow"><select><option>db_b</option></select><span class="badge b-warn">空</span></div>
+      <div class="dst-list">
+        <div class="dst-row"><span class="nm">huge</span><span class="badge-sm" style="background:#1a2740;color:var(--accent)">新建</span></div>
+        <div class="dst-row"><span class="nm">simple</span><span class="badge-sm" style="background:#1a2740;color:var(--accent)">新建</span></div>
+        <div class="dst-row"><span class="nm">bulk</span><span class="badge-sm" style="background:#1a2740;color:var(--accent)">新建</span></div>
+        <div class="dst-row"><span class="nm">big_unsigned</span><span class="badge-sm" style="background:#1a2740;color:var(--accent)">新建</span></div>
+      </div>
+      <div style="padding:6px 10px;border-top:1px solid var(--border);font-size:10.5px;color:var(--muted)">
+        写入 <b style="color:var(--text)">UPSERT</b>
+      </div>
+    </div>
+  </div>
+
+  <div class="drawer">
+    <div class="drawer-head">
+      <b>运行</b><span style="color:var(--muted)">待预检</span>
+      <span class="pill on">进度 4</span><span class="pill">预检 4</span><span class="pill">建表 DDL 4</span><span class="pill">日志</span>
+    </div>
+  </div>
+</body></html>

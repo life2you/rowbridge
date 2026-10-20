@@ -1,0 +1,38 @@
+<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><title>逐表游标 · 三个方案</title>
+<style>
+body{margin:0;background:#0f1115;color:#e6e9ef;font:13px/1.5 -apple-system,"PingFang SC",sans-serif;padding:24px}
+h1{font-size:18px;margin:0 0 4px}p.sub{color:#8b94a7;margin:0 0 22px;font-size:12.5px;max-width:1100px;line-height:1.6}
+.grid{display:grid;grid-template-columns:1fr;gap:22px;max-width:1320px}
+.card{background:#171a21;border:1px solid #2a2f3a;border-radius:10px;overflow:hidden;text-decoration:none;color:inherit;display:block;transition:border-color .15s}
+.card:hover{border-color:#4f8cff}
+.card img{width:100%;display:block;border-bottom:1px solid #2a2f3a}
+.meta{padding:12px 15px}
+.meta b{font-size:14px}
+.meta p{margin:5px 0 0;font-size:12.5px;color:#8b94a7;line-height:1.6}
+.tag{display:inline-block;font-size:10.5px;padding:1px 7px;border-radius:4px;margin-left:7px;vertical-align:middle}
+.t-ok{background:#16301c;color:#3fb950}.t-warn{background:#33280e;color:#d29922}
+.pros{display:flex;gap:16px;margin-top:7px;font-size:11.5px}
+.pros span{color:#8b94a7}.pros .y{color:#3fb950}.pros .n{color:#f85149}
+</style></head><body>
+<h1>逐表游标 · 三个方案</h1>
+<p class="sub">现在游标是全局的：所有勾选的表共用同一个起始/结束 id。问题在于各表主键范围不同 ——<code style="background:#1e222b;padding:1px 5px;border-radius:3px">huge</code> 的 id 到 50 万，<code style="background:#1e222b;padding:1px 5px;border-radius:3px">simple</code> 只有 1-5，填同一个自定义起点必然有一张表同步不到。下面三种改法，点开可交互查看。</p>
+<div class="grid">
+  <a class="card" href="e-cursor-inline.html"><img src="shot-e.png"><div class="meta">
+    <b>E · 行内展开</b><span class="tag t-ok">改动最小</span>
+    <p>保持现有双栏不变，勾选后每行右侧出现「游标」小按钮，点开就地展开起止输入。没设过的行显示「跟随全局」。</p>
+    <div class="pros"><span class="y">✓ 不打断选表节奏</span><span class="y">✓ 只给个别表设区间时最顺手</span><span class="n">✗ 表多时要一个个点开</span></div>
+  </div></a>
+
+  <a class="card" href="f-cursor-grid.html"><img src="shot-f.png"><div class="meta">
+    <b>F · 批次表格</b><span class="tag t-ok">适合批量</span>
+    <p>中间区域变成一张可编辑表格：所有已选表的源 MAX、目标 MAX、模式、起止 id、预计行数一屏看全。顶部有批量设置条，可一次给多张表套同一区间。</p>
+    <div class="pros"><span class="y">✓ 全局对比最清楚，一眼看出哪张表设错了</span><span class="y">✓ 支持批量套用</span><span class="n">✗ 挤占了原来的参数区，参数得挪走</span></div>
+  </div></a>
+
+  <a class="card" href="g-cursor-detail.html"><img src="shot-g.png"><div class="meta">
+    <b>G · 单表详情</b><span class="tag t-warn">信息最全</span>
+    <p>点表进入详情页：表信息、游标模式（自定义/全量/续传/跟随全局）、同步区间、预计行数、风险提示都在一页。下方列出其他已选表，点一行即可切换。</p>
+    <div class="pros"><span class="y">✓ 能给足解释和校验提示</span><span class="y">✓ 最不容易填错</span><span class="n">✗ 多了一次点击，逐表配置变慢</span></div>
+  </div></a>
+</div>
+</body></html>

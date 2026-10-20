@@ -143,6 +143,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     dst_schema: to.clone(),
                     dst_table: None,
                     columns: Vec::new(),
+                    cursor_start: None,
+                    start_id: None,
+                    end_id: None,
                 })
                 .collect();
 

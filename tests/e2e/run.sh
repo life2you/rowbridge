@@ -184,6 +184,17 @@ dst_md5=$(dst_mysql "SELECT MD5(GROUP_CONCAT(MD5(CONCAT(id,'#',v)) ORDER BY id S
 eq "续跑后内容与源表一致" "$src_md5" "$dst_md5"
 
 echo
+echo "== 17. 逐表游标：各表用各自区间，互不影响 =="
+dst_exec "DROP DATABASE IF EXISTS db_b; CREATE DATABASE db_b"
+# 用 Rust 集成测试直接驱动引擎，给两张表设不同区间，
+# 断言各自只同步自己那段（CLI 只暴露全局游标，覆盖不到这里）。
+if cargo test -p rowbridge-core --test per_table_cursor -- --nocapture 2>&1 | grep -q "test result: ok"; then
+  ok "两张表各用自己的游标区间（集成测试）"
+else
+  bad "两张表各用自己的游标区间" "test result: ok" "见 cargo test 输出"
+fi
+
+echo
 echo "==================================="
 printf "通过 \033[32m%d\033[0m，失败 \033[31m%d\033[0m\n" "$PASS" "$FAIL"
 [ "$FAIL" -eq 0 ] || exit 1

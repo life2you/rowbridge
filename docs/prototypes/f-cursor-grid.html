@@ -1,0 +1,191 @@
+<!doctype html>
+<html lang="zh-CN"><head><meta charset="utf-8"><link rel="stylesheet" href="base.css">
+<style>
+  body { display: flex; flex-direction: column; }
+  .top { height: 44px; display: flex; align-items: center; gap: 10px; padding: 0 12px 0 78px; border-bottom: 1px solid var(--border); background: var(--panel); flex-shrink: 0; }
+  .cols { flex: 1; display: flex; min-height: 0; }
+
+  .pane { width: 250px; flex-shrink: 0; display: flex; flex-direction: column; border-right: 1px solid var(--border); }
+  .pane-head { display: flex; align-items: center; gap: 7px; padding: 7px 11px; border-bottom: 1px solid var(--border); }
+  .dot { width: 7px; height: 7px; border-radius: 50%; }
+  .dbrow { display: flex; align-items: center; gap: 7px; padding: 6px 11px; background: var(--panel2); border-bottom: 1px solid var(--border); }
+  .dbrow select { flex: 1; font-size: 12px; font-weight: 600; }
+  .list { flex: 1; overflow-y: auto; }
+  .row { display: flex; align-items: center; gap: 7px; padding: 3.5px 11px; font-size: 12px; }
+  .row:hover { background: #1a1e27; }
+  .row.pick { background: #17233a; }
+  .row.off { opacity: .4; }
+  .nm { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .meta { margin-left: auto; font-size: 10px; color: var(--dim); flex-shrink: 0; }
+
+  /* —— 方案 F 的核心：中间一张可编辑的批次表 —— */
+  .main { flex: 1; min-width: 0; display: flex; flex-direction: column; }
+  .main-head { display: flex; align-items: center; gap: 9px; padding: 7px 13px; border-bottom: 1px solid var(--border); background: var(--panel); flex-shrink: 0; }
+  .main-head h2 { font-size: 12.5px; font-weight: 600; }
+  .toolbar { display: flex; align-items: center; gap: 7px; padding: 6px 13px; border-bottom: 1px solid var(--border); background: #14171d; flex-shrink: 0; font-size: 11px; }
+  .toolbar .lbl { color: var(--muted); }
+  .toolbar input, .toolbar select { font-size: 11px; padding: 2px 6px; width: 76px; }
+
+  .gridwrap { flex: 1; overflow-y: auto; }
+  table { width: 100%; border-collapse: collapse; font-size: 12px; }
+  thead th { position: sticky; top: 0; z-index: 2; background: #171a21; text-align: left; font-size: 10px; text-transform: uppercase; letter-spacing: .4px; color: var(--muted); font-weight: 500; padding: 6px 9px; border-bottom: 1px solid var(--border); white-space: nowrap; }
+  tbody td { padding: 5px 9px; border-bottom: 1px solid #1e222b; vertical-align: middle; }
+  tbody tr:hover td { background: #151922; }
+  tbody tr.sel td { background: #141c2b; }
+  .tname { font-weight: 600; }
+  .num { text-align: right; font-family: "SF Mono", monospace; font-size: 11px; }
+  .cen { text-align: center; }
+  table input, table select { font-size: 11px; padding: 2px 6px; width: 100%; }
+  table input::placeholder { color: #4a5265; }
+  .inherit { color: var(--dim); }
+  .eff { font-family: "SF Mono", monospace; font-size: 10.5px; color: var(--accent); }
+  .eff.default { color: var(--dim); }
+  .est { font-family: "SF Mono", monospace; font-size: 10.5px; }
+
+  .footbar { flex-shrink: 0; display: flex; align-items: center; gap: 10px; padding: 8px 13px; border-top: 1px solid var(--border); background: var(--panel); }
+  .sum { font-size: 11px; color: var(--muted); }
+  .sum b { color: var(--text); }
+
+  .drawer { flex-shrink: 0; border-top: 1px solid var(--border); background: var(--panel); }
+  .drawer-head { display: flex; align-items: center; gap: 9px; padding: 6px 12px; font-size: 11px; }
+  .pill { padding: 1px 7px; border-radius: 9px; font-size: 10.5px; background: #242935; color: var(--muted); }
+  .pill.on { background: #17233a; color: var(--accent); }
+</style></head>
+<body>
+  <div class="top">
+    <span style="font-size:13px;font-weight:600">RowBridge</span><span class="brand-sub">MySQL 同步</span>
+    <span class="badge b-ok">预检通过 4</span>
+    <div style="margin-left:auto"><button class="btn btn-ghost btn-sm">历史</button></div>
+  </div>
+
+  <div class="cols">
+    <div class="pane">
+      <div class="pane-head"><i class="dot" style="background:var(--accent)"></i><span style="font-size:12px;font-weight:600">源</span>
+        <span class="mono" style="font-size:10.5px;color:var(--muted)">:3307</span>
+        <button class="btn btn-ghost btn-sm" style="margin-left:auto">切换</button></div>
+      <div class="dbrow"><select><option>db_a</option></select><span class="badge b-ok">18 表</span></div>
+      <div class="list">
+        <div class="row"><input type="checkbox" class="check"><span class="nm">big_blob</span><span class="meta">2</span></div>
+        <div class="row pick"><input type="checkbox" class="check" checked><span class="nm">big_unsigned</span><span class="meta">4</span></div>
+        <div class="row pick"><input type="checkbox" class="check" checked><span class="nm">bulk</span><span class="meta">10,000</span></div>
+        <div class="row"><input type="checkbox" class="check"><span class="nm">child_t</span><span class="meta">2</span></div>
+        <div class="row off"><input type="checkbox" class="check" disabled><span class="nm">composite_pk</span><span class="meta" style="color:var(--err)">不支持</span></div>
+        <div class="row"><input type="checkbox" class="check"><span class="nm">empty_t</span><span class="meta">0</span></div>
+        <div class="row"><input type="checkbox" class="check"><span class="nm">generated_col</span><span class="meta">2</span></div>
+        <div class="row pick"><input type="checkbox" class="check" checked><span class="nm">huge</span><span class="meta">494,161</span></div>
+        <div class="row pick"><input type="checkbox" class="check" checked><span class="nm">simple</span><span class="meta">5</span></div>
+        <div class="row"><input type="checkbox" class="check"><span class="nm">sparse</span><span class="meta">4</span></div>
+        <div class="row off"><input type="checkbox" class="check" disabled><span class="nm">str_pk</span><span class="meta" style="color:var(--err)">不支持</span></div>
+        <div class="row"><input type="checkbox" class="check"><span class="nm">types_all</span><span class="meta">1</span></div>
+        <div class="row"><input type="checkbox" class="check"><span class="nm">wide</span><span class="meta">5</span></div>
+      </div>
+      <div style="padding:6px 11px;border-top:1px solid var(--border);font-size:11px;color:var(--muted)">已选 <b style="color:var(--text)">4</b> 张</div>
+    </div>
+
+    <div class="main">
+      <div class="main-head">
+        <h2>同步批次</h2>
+        <span class="sum">4 张表</span>
+        <div style="margin-left:auto;display:flex;gap:7px">
+          <button class="btn btn-sm">预检</button>
+          <button class="btn btn-sm btn-primary" style="background:var(--accent);border-color:transparent;color:#fff">开始同步</button>
+        </div>
+      </div>
+
+      <!-- 批量工具条：一次给多张表套同一套游标 -->
+      <div class="toolbar">
+        <span class="lbl">批量设置：</span>
+        <select><option>起始 id</option><option>起始 + 结束</option><option>模式</option></select>
+        <input placeholder="100000">
+        <span class="lbl">到</span>
+        <input placeholder="不限">
+        <button class="btn btn-sm">应用到此 4 张</button>
+        <span style="margin-left:auto;color:var(--dim)">勾选后逐表覆盖</span>
+      </div>
+
+      <div class="gridwrap">
+        <table>
+          <thead><tr>
+            <th style="width:26px"><input type="checkbox" class="check" checked style="width:12px;height:12px"></th>
+            <th>表</th>
+            <th style="width:74px">主键</th>
+            <th style="width:82px" class="num">源 MAX</th>
+            <th style="width:82px" class="num">目标 MAX</th>
+            <th style="width:120px">模式</th>
+            <th style="width:104px">起始 id</th>
+            <th style="width:104px">结束 id</th>
+            <th style="width:96px" class="num">预计行数</th>
+          </tr></thead>
+          <tbody>
+            <tr class="sel">
+              <td><input type="checkbox" class="check" checked style="width:12px;height:12px"></td>
+              <td class="tname">huge</td>
+              <td class="mono" style="color:var(--muted);font-size:10.5px">id</td>
+              <td class="num">494,161</td>
+              <td class="num inherit">—</td>
+              <td><select><option>跟随全局</option><option>续传</option><option selected>自定义</option></select></td>
+              <td><input value="100000"></td>
+              <td><input value="200000"></td>
+              <td class="num est" style="color:var(--accent)">100,001</td>
+            </tr>
+            <tr class="sel">
+              <td><input type="checkbox" class="check" checked style="width:12px;height:12px"></td>
+              <td class="tname">bulk</td>
+              <td class="mono" style="color:var(--muted);font-size:10.5px">id</td>
+              <td class="num">10,000</td>
+              <td class="num inherit">—</td>
+              <td><select><option>跟随全局</option><option>续传</option><option>自定义</option></select></td>
+              <td><input placeholder="不限"></td>
+              <td><input placeholder="不限"></td>
+              <td class="num est inherit">10,001</td>
+            </tr>
+            <tr class="sel">
+              <td><input type="checkbox" class="check" checked style="width:12px;height:12px"></td>
+              <td class="tname">simple</td>
+              <td class="mono" style="color:var(--muted);font-size:10.5px">id</td>
+              <td class="num">5</td>
+              <td class="num inherit">—</td>
+              <td><select><option>跟随全局</option><option>续传</option><option selected>自定义</option></select></td>
+              <td><input value="3"></td>
+              <td><input placeholder="不限"></td>
+              <td class="num est" style="color:var(--accent)">2</td>
+            </tr>
+            <tr class="sel">
+              <td><input type="checkbox" class="check" checked style="width:12px;height:12px"></td>
+              <td class="tname">big_unsigned</td>
+              <td class="mono" style="color:var(--muted);font-size:10.5px">id</td>
+              <td class="num">1.8e19</td>
+              <td class="num inherit">—</td>
+              <td><select><option selected>跟随全局</option><option>续传</option><option>自定义</option></select></td>
+              <td><input placeholder="不限"></td>
+              <td><input placeholder="不限"></td>
+              <td class="num est inherit">4</td>
+            </tr>
+          </tbody>
+        </table>
+
+        <div style="padding:9px 13px;font-size:10.5px;color:var(--dim);display:flex;gap:14px;border-bottom:1px solid #1e222b">
+          <span>全局默认 <b style="color:var(--muted)">全量</b></span>
+          <span>未填的格子继承全局</span>
+          <span style="color:var(--warn)">huge 的结束 id 200000 小于源 MAX，只同步区间</span>
+        </div>
+      </div>
+
+      <div class="footbar">
+        <span class="sum">预计同步 <b>110,018</b> 行</span>
+        <span class="sum" style="color:var(--dim)">2 张用自定义游标 · 2 张跟随全局</span>
+        <div style="margin-left:auto;display:flex;gap:7px;align-items:center">
+          <span style="font-size:10.5px;color:var(--muted)">并行</span><input value="2" style="width:44px;font-size:11px;padding:2px 6px">
+          <span style="font-size:10.5px;color:var(--muted)">批</span><input value="1000" style="width:56px;font-size:11px;padding:2px 6px">
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <div class="drawer">
+    <div class="drawer-head">
+      <b>运行</b><span style="color:var(--muted)">待预检</span>
+      <span class="pill on">进度 4</span><span class="pill">预检 4</span><span class="pill">建表 DDL 4</span><span class="pill">日志</span>
+    </div>
+  </div>
+</body></html>

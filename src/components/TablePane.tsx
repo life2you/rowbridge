@@ -85,7 +85,9 @@ export function TablePane({
   return (
     <div
       className={cn(
-        "flex min-w-0 flex-1 flex-col",
+        // 侧栏定宽：中间那张批次表需要足够的横向空间放 7 列，
+        // 三栏等分的话表头会被挤成竖排。
+        "flex w-[236px] shrink-0 flex-col",
         !isSrc && "bg-[#12151b]",
       )}
     >
@@ -93,12 +95,15 @@ export function TablePane({
       <div className="flex shrink-0 items-center gap-2 border-b border-[var(--color-border)] px-3 py-2">
         <i className="h-2 w-2 shrink-0 rounded-full" style={{ background: dot }} />
         <span className="text-[12.5px] font-semibold">{isSrc ? "源" : "目标"}</span>
-        <span className="mono truncate text-[11px] text-[var(--color-muted)]">
-          {conn.host}:{conn.port} · {conn.username}
+        <span
+          className="mono min-w-0 flex-1 truncate text-[10.5px] text-[var(--color-muted)]"
+          title={`${conn.host}:${conn.port} · ${conn.username}`}
+        >
+          {conn.host}:{conn.port}
         </span>
         {testResult?.ok && (
           <Badge tone="ok">
-            v{testResult.version} · {testResult.schemas} 库
+            <span className="whitespace-nowrap">v{testResult.version}</span>
           </Badge>
         )}
         <button
@@ -106,7 +111,7 @@ export function TablePane({
           data-testid={`${side}-toggle-conn`}
           disabled={disabled}
           onClick={() => setShowConn((v) => !v)}
-          className="ml-auto shrink-0 rounded px-2 py-0.5 text-[11px] text-[var(--color-muted)] hover:bg-[#222733] hover:text-[var(--color-text)]"
+          className="shrink-0 rounded px-1.5 py-0.5 text-[11px] text-[var(--color-muted)] hover:bg-[#222733] hover:text-[var(--color-text)]"
         >
           {showConn ? "收起" : "切换"}
         </button>

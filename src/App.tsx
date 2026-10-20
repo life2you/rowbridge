@@ -11,12 +11,13 @@ import type {
 } from "./lib/types";
 import { cn } from "./lib/format";
 import { emptyRun, reduceRun, type RunState } from "./lib/run";
+import type { TableCursor } from "./lib/cursor";
 import {
   newConnection,
   type ConnectionDraft,
 } from "./components/ConnectionEditor";
 import { TablePane } from "./components/TablePane";
-import { TransferBar } from "./components/TransferBar";
+import { BatchView } from "./components/BatchView";
 import { RunDrawer } from "./components/RunDrawer";
 import { HistoryPanel } from "./components/HistoryPanel";
 import { Badge } from "./components/ui";
@@ -63,6 +64,8 @@ export default function App() {
 
   const [selected, setSelected] = useState<Set<string>>(new Set());
   const [options, setOptions] = useState<OptionsForm>(defaultOptions);
+  // 每张表的游标覆写。缺省 = 跟随 options 里的全局设置。
+  const [overrides, setOverrides] = useState<Record<string, TableCursor>>({});
 
   const [report, setReport] = useState<PreflightReport | null>(null);
   const [preflighting, setPreflighting] = useState(false);
@@ -131,7 +134,7 @@ export default function App() {
   useEffect(() => {
     setReport(null);
     setPreflightError(null);
-  }, [srcSchema, dstSchema, selected, options]);
+  }, [srcSchema, dstSchema, selected, options, overrides]);
 
   // ---- 选择 ----
   const toggleTable = (name: string) =>
@@ -162,7 +165,16 @@ export default function App() {
     target: dstConn,
     src_schema: srcSchema!,
     dst_schema: dstSchema!,
-    tables: selectedList.map((t) => ({ table: t.name, dst_table: null })),
+    tables: selectedList.map((t) => {
+      const ov = overrides[t.name] ?? {};
+      return {
+        table: t.name,
+        dst_table: null,
+        cursor_start: ov.cursor_start ?? null,
+        start_id: ov.start_id ?? null,
+        end_id: ov.end_id ?? null,
+      };
+    }),
     options,
   });
 
@@ -287,19 +299,36 @@ export default function App() {
               disabled={run.running}
             />
 
-            <TransferBar
-              count={selectedList.length}
-              totalRows={totalRows}
-              options={options}
-              onOptionsChange={setOptions}
-              onPreflight={doPreflight}
-              onStart={doStart}
-              preflighting={preflighting}
-              canPreflight={canPreflight}
-              canStart={canStart}
-              running={run.running}
-              hasReport={!!report}
-            />
+            <div className="relative flex min-w-[560px] flex-1 flex-col">
+              <BatchView
+                rows={selectedList}
+                overrides={overrides}
+                onChange={(t, ov) =>
+                  setOverrides((prev) => ({ ...prev, [t]: ov }))
+                }
+                global={{
+                  cursor_start: options.cursor_start,
+                  start_id: options.start_id ?? null,
+                  end_id: options.end_id ?? null,
+                }}
+                onGlobalChange={(g) =>
+                  setOptions({
+                    ...options,
+                    cursor_start: g.cursor_start,
+                    start_id: g.start_id,
+                    end_id: g.end_id,
+                  })
+                }
+                onRemove={toggleTable}
+                onPreflight={doPreflight}
+                onStart={doStart}
+                preflighting={preflighting}
+                canPreflight={canPreflight}
+                canStart={canStart}
+                running={run.running}
+                hasReport={!!report}
+              />
+            </div>
 
             <TablePane
               side="dst"

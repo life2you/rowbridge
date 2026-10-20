@@ -22,7 +22,7 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
-use crate::config::{ConnConfig, CursorStart, TaskConfig, TaskOptions, WriteMode};
+use crate::config::{ConnConfig, CursorStart, TableTaskConfig, TaskConfig, TaskOptions, WriteMode};
 use crate::introspect;
 use crate::preflight::{self, TablePreflight};
 use crate::value::{self, parse_cursor_value, qualified, quote_ident, Cursor};
@@ -109,6 +109,8 @@ struct TableRun {
     columns: Vec<String>,
     cursor: Cursor,
     end_id: Option<i128>,
+    /// 结束主键的原始 Value，用于下推到 SQL 的 `pk <= ?`
+    end_pk: Option<Value>,
     batch_size: usize,
     src_schema: String,
     dst_schema: String,
@@ -177,10 +179,26 @@ pub async fn run_task(
         let opts = opts.clone();
         let sink = sink.clone();
         let cancel = cancel.clone();
+        // 按表名找回它自己的配置；找不到就用手上这份
+        let table_cfg = cfg
+            .tables
+            .iter()
+            .find(|t| t.table == pf.table)
+            .cloned()
+            .unwrap_or_else(|| TableTaskConfig {
+                table: pf.table.clone(),
+                src_schema: pf.source_schema.clone(),
+                dst_schema: pf.target_schema.clone(),
+                dst_table: Some(pf.target_table.clone()),
+                columns: Vec::new(),
+                cursor_start: None,
+                start_id: None,
+                end_id: None,
+            });
 
         futs.push(tokio::spawn(async move {
             let _permit = permit;
-            run_table(src_cfg, dst_cfg, opts, pf, sink, cancel).await
+            run_table(src_cfg, dst_cfg, opts, table_cfg, pf, sink, cancel).await
         }));
     }
 
@@ -339,6 +357,7 @@ async fn run_table(
     src_cfg: ConnConfig,
     dst_cfg: ConnConfig,
     opts: TaskOptions,
+    table_cfg: TableTaskConfig,
     pf: TablePreflight,
     sink: EventSink,
     cancel: CancellationToken,
@@ -358,7 +377,10 @@ async fn run_table(
         ..Default::default()
     };
 
-    let result = sync_one(&src_cfg, &dst_cfg, &opts, &pf, &sink, &cancel, &mut stats).await;
+    let result = sync_one(
+        &src_cfg, &dst_cfg, &opts, &table_cfg, &pf, &sink, &cancel, &mut stats,
+    )
+    .await;
     stats.elapsed_ms = started.elapsed().as_millis() as u64;
 
     match result {
@@ -400,6 +422,7 @@ async fn sync_one(
     src_cfg: &ConnConfig,
     dst_cfg: &ConnConfig,
     opts: &TaskOptions,
+    table_cfg: &TableTaskConfig,
     pf: &TablePreflight,
     sink: &EventSink,
     cancel: &CancellationToken,
@@ -424,29 +447,54 @@ async fn sync_one(
     let packet = introspect::max_allowed_packet(&mut dst).await?;
     let budget = (packet as f64 * PACKET_BUDGET_RATIO) as u64;
 
-    let cursor = match opts.cursor_start {
+    // 每张表有自己的游标：表级配置优先，没有则回落到全局。
+    let eff_cursor_start = table_cfg.effective_cursor_start(opts);
+    let eff_start_id = table_cfg
+        .effective_start_id(opts)
+        .filter(|s| !s.trim().is_empty());
+    let eff_end_id = table_cfg
+        .effective_end_id(opts)
+        .filter(|s| !s.trim().is_empty());
+
+    let cursor = match eff_cursor_start {
         CursorStart::Full => Cursor::start(),
         CursorStart::Resume => {
             let max = read_max_pk(&mut dst, &pf.target_schema, &pf.target_table, &pk).await?;
             Cursor::from_max_pk(max)
         }
-        CursorStart::Custom => match &opts.start_id {
-            Some(s) if !s.trim().is_empty() => {
-                Cursor(Some(parse_cursor_value(s, pf.primary_key_unsigned)?))
-            }
+        CursorStart::Custom => match &eff_start_id {
+            Some(s) => Cursor(Some(parse_cursor_value(s, pf.primary_key_unsigned)?)),
             _ => Cursor::start(),
         },
     };
 
-    let end_id = match &opts.end_id {
-        Some(s) if !s.trim().is_empty() => {
+    let (end_id, end_pk) = match &eff_end_id {
+        Some(s) => {
             let v = parse_cursor_value(s, pf.primary_key_unsigned)?;
-            Some(value::value_as_i128(&v).ok_or_else(|| {
+            let as_int = value::value_as_i128(&v).ok_or_else(|| {
                 Error::Config(format!("结束游标 `{s}` 不是合法整数"))
-            })?)
+            })?;
+            (Some(as_int), Some(v))
         }
-        _ => None,
+        None => (None, None),
     };
+
+    if table_cfg.has_cursor_override() {
+        sink.emit(Event::Log {
+            table: Some(pf.table.clone()),
+            level: "info".into(),
+            message: format!(
+                "本表独立游标：{} 起 {}，止 {}",
+                match eff_cursor_start {
+                    CursorStart::Full => "全量",
+                    CursorStart::Resume => "续传",
+                    CursorStart::Custom => "自定义",
+                },
+                eff_start_id.as_deref().unwrap_or("无"),
+                eff_end_id.as_deref().unwrap_or("不限"),
+            ),
+        });
+    }
 
     let pk_index = pf
         .columns
@@ -460,6 +508,7 @@ async fn sync_one(
         columns: pf.columns.clone(),
         cursor,
         end_id,
+        end_pk,
         batch_size: opts.batch_size.clamp(MIN_BATCH, opts.max_batch_size.max(MIN_BATCH)),
         src_schema: pf.source_schema.clone(),
         dst_schema: pf.target_schema.clone(),
@@ -623,29 +672,35 @@ async fn fetch_batch(src: &mut Conn, run: &TableRun) -> Result<(Vec<Vec<Value>>,
         .collect::<Vec<_>>()
         .join(", ");
 
-    let (sql, params) = if run.cursor.is_start() {
-        (
-            format!(
-                "SELECT {cols} FROM {} ORDER BY {} ASC LIMIT ?",
-                qualified(&run.src_schema, &run.src_table),
-                quote_ident(&run.pk)
-            ),
-            Params::Positional(vec![Value::UInt(run.batch_size as u64)]),
-        )
+    // 结束游标必须下推到 SQL 的 WHERE 里。
+    // 只在写完一批之后再比较 end_id 的话，最后一批会整批写进去，
+    // 最多超出 end_id 边界 batch_size-1 行 —— 这是实打实的数据错误。
+    let mut conds: Vec<String> = Vec::new();
+    let mut params: Vec<Value> = Vec::new();
+
+    if let Some(v) = &run.cursor.0 {
+        conds.push(format!("{} > ?", quote_ident(&run.pk)));
+        params.push(v.clone());
+    }
+    if let Some(end) = &run.end_pk {
+        conds.push(format!("{} <= ?", quote_ident(&run.pk)));
+        params.push(end.clone());
+    }
+
+    let where_clause = if conds.is_empty() {
+        String::new()
     } else {
-        (
-            format!(
-                "SELECT {cols} FROM {} WHERE {} > ? ORDER BY {} ASC LIMIT ?",
-                qualified(&run.src_schema, &run.src_table),
-                quote_ident(&run.pk),
-                quote_ident(&run.pk)
-            ),
-            Params::Positional(vec![
-                run.cursor.0.clone().expect("非起始游标"),
-                Value::UInt(run.batch_size as u64),
-            ]),
-        )
+        format!(" WHERE {}", conds.join(" AND "))
     };
+
+    let sql = format!(
+        "SELECT {cols} FROM {}{where_clause} ORDER BY {} ASC LIMIT ?",
+        qualified(&run.src_schema, &run.src_table),
+        quote_ident(&run.pk)
+    );
+    params.push(Value::UInt(run.batch_size as u64));
+
+    let params = Params::Positional(params);
 
     let mut result = src.exec_iter(sql, params).await?;
     let mut rows: Vec<Vec<Value>> = Vec::with_capacity(run.batch_size.min(4096));

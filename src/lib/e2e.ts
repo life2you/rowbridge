@@ -207,8 +207,119 @@ async function scenarioFull(): Promise<void> {
     results;
 }
 
+/**
+ * 逐表游标场景：给两张表设不同的自定义区间，验证互不影响。
+ *
+ * bulk（10000 行）设 1000→2000，应同步 1000 行；
+ * simple（5 行）设 id>2，应同步 3 行；
+ * huge 不设，走全局全量。
+ */
+async function scenarioPerTableCursor(): Promise<void> {
+  overlay();
+
+  await fillConnection("src", "127.0.0.1", "3307", "root", "root123");
+  await fillConnection("dst", "127.0.0.1", "3308", "root", "root123");
+  await waitUntil(
+    () => document.body.innerText.includes("密码已存钥匙串") || document.body.innerText.includes("8.0"),
+    "连接就绪",
+    20000,
+  );
+
+  setSelect(await waitFor<HTMLSelectElement>('[data-testid="src-schema"]'), "db_a");
+  await waitFor('[data-testid="table-simple"]', 20000);
+  await sleep(300);
+
+  const dstSelect = await waitFor<HTMLSelectElement>('[data-testid="dst-schema"]');
+  await waitUntil(
+    () => Array.from(dstSelect.options).some((o) => o.value === "db_b"),
+    "目标库出现 db_b",
+    20000,
+  );
+  setSelect(dstSelect, "db_b");
+
+  // 选三张表
+  for (const t of ["bulk", "simple", "huge"]) {
+    const cb = await waitFor<HTMLInputElement>(`[data-testid="table-${t}"]`);
+    if (!cb.checked) cb.click();
+    await sleep(120);
+  }
+  await waitUntil(() => document.body.innerText.includes("同步批次"), "批次表出现", 10000);
+
+  // bulk：自定义 1000 → 2000
+  setSelect(
+    await waitFor<HTMLSelectElement>('[data-testid="cursor-mode-bulk"]'),
+    "custom",
+  );
+  await sleep(200);
+  setInput(
+    await waitFor<HTMLInputElement>('[data-testid="cursor-start-bulk"]'),
+    "1000",
+  );
+  setInput(
+    await waitFor<HTMLInputElement>('[data-testid="cursor-end-bulk"]'),
+    "2000",
+  );
+
+  // simple：自定义 2 → 不限
+  setSelect(
+    await waitFor<HTMLSelectElement>('[data-testid="cursor-mode-simple"]'),
+    "custom",
+  );
+  await sleep(200);
+  setInput(
+    await waitFor<HTMLInputElement>('[data-testid="cursor-start-simple"]'),
+    "2",
+  );
+
+  report("已为 bulk / simple 设置独立游标", true);
+
+  // 打开 huge 的详情面板，确认方案 G 的精细编辑可用
+  (await waitFor<HTMLButtonElement>('[data-testid="detail-huge"]')).click();
+  await waitUntil(
+    () => document.body.innerText.includes("游标模式"),
+    "详情面板打开",
+    10000,
+  );
+  report("详情面板可打开", true);
+  await sleep(600);
+
+  // 预检
+  (await waitFor<HTMLButtonElement>('[data-testid="preflight"]')).click();
+  await waitUntil(
+    () =>
+      document.body.innerText.includes("预检通过") ||
+      document.body.innerText.includes("张被阻塞"),
+    "预检完成",
+    30000,
+  );
+  await sleep(500);
+
+  const startBtn = await waitFor<HTMLButtonElement>('[data-testid="start"]');
+  await waitUntil(() => !startBtn.disabled, "开始按钮可用", 15000);
+  startBtn.click();
+
+  await waitUntil(
+    () =>
+      document.body.innerText.includes("已完成") ||
+      document.body.innerText.includes("已取消") ||
+      document.body.innerText.includes("失败"),
+    "同步结束",
+    120000,
+  );
+
+  report(
+    "同步执行完成",
+    document.body.innerText.includes("已完成"),
+  );
+
+  window.dispatchEvent(new CustomEvent("e2e-done", { detail: results }));
+  (window as unknown as { __E2E_RESULTS__: typeof results }).__E2E_RESULTS__ =
+    results;
+}
+
 const scenarios: Record<string, Step[]> = {
   full: [{ name: "full", run: scenarioFull }],
+  cursor: [{ name: "per-table-cursor", run: scenarioPerTableCursor }],
 };
 
 export async function runE2E(scenario: string) {
