@@ -409,7 +409,18 @@ async function scenarioDataSource(): Promise<void> {
   );
   report("编辑数据源成功", true);
 
-  // 删除
+  // 暂不删除，留给人工检查 connections.json 里的密码
+
+  window.dispatchEvent(new CustomEvent("e2e-done", { detail: results }));
+  (window as unknown as { __E2E_RESULTS__: typeof results }).__E2E_RESULTS__ = results;
+}
+
+/** 第二阶段：验证密码在配置文件里、且删除正常。 */
+async function scenarioDataSourceCleanup(): Promise<void> {
+  overlay();
+  await sleep(1500);
+  (await waitFor<HTMLButtonElement>('[data-testid="nav-datasources"]')).click();
+  await sleep(500);
   const delBtn = Array.from(document.querySelectorAll("button")).find(
     (b) => b.textContent?.trim() === "删除",
   );
@@ -470,7 +481,49 @@ async function scenarioBatchCtl(): Promise<void> {
   (window as unknown as { __E2E_RESULTS__: typeof results }).__E2E_RESULTS__ = results;
 }
 
+/** 选已保存数据源 → 不填密码 → 看能否连上（密码来自配置文件）。 */
+async function scenarioPickSaved(): Promise<void> {
+  overlay();
+  await sleep(1500);
+
+  // 选已保存的数据源，不填密码
+  const savedSel = await waitFor<HTMLSelectElement>('[data-testid="src-saved"]');
+  const opt = Array.from(savedSel.options).find((o) => o.value !== "");
+  if (!opt) {
+    report("有已保存数据源可选", false, "下拉里没有条目");
+  } else {
+    setSelect(savedSel, opt.value);
+    await sleep(600);
+    // 目标也选同一个数据源（模拟同实例跨库场景）
+    const dstSel = await waitFor<HTMLSelectElement>('[data-testid="dst-saved"]');
+    const dstOpt = Array.from(dstSel.options).find((o) => o.value !== "");
+    if (dstOpt) setSelect(dstSel, dstOpt.value);
+    await sleep(600);
+
+    // 源选库
+    setSelect(await waitFor<HTMLSelectElement>('[data-testid="src-schema"]'), "db_a");
+    await waitFor('[data-testid="table-simple"]', 20000);
+    await sleep(400);
+    const cb = await waitFor<HTMLInputElement>('[data-testid="table-simple"]');
+    if (!cb.checked) cb.click();
+    await sleep(300);
+
+    // 目标选 db_b，看是否也能用保存的密码连上
+    const dstSchemaSel = await waitFor<HTMLSelectElement>('[data-testid="dst-schema"]');
+    const hasDbB = Array.from(dstSchemaSel.options).some((o) => o.value === "db_b");
+    report(
+      "不填密码即可用已保存数据源连接（目标库列表已加载）",
+      hasDbB,
+    );
+  }
+
+  window.dispatchEvent(new CustomEvent("e2e-done", { detail: results }));
+  (window as unknown as { __E2E_RESULTS__: typeof results }).__E2E_RESULTS__ = results;
+}
+
 const scenarios: Record<string, Step[]> = {
+  picksaved: [{ name: "picksaved", run: scenarioPickSaved }],
+  datasource_cleanup: [{ name: "cleanup", run: scenarioDataSourceCleanup }],
   batchctl: [{ name: "batchctl", run: scenarioBatchCtl }],
   datasource: [{ name: "datasource", run: scenarioDataSource }],
   persist: [{ name: "persist", run: scenarioPersist }],

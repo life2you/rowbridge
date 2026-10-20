@@ -82,19 +82,16 @@ export function TablePane({
   async function handleSave() {
     setSaving(true);
     try {
-      const list = await api.saveConnection(
-        {
-          id: conn.id,
-          name: connName.trim() || `${conn.host}:${conn.port}`,
-          host: conn.host,
-          port: conn.port,
-          username: conn.username,
-          use_tls: !!conn.use_tls,
-          last_schema: null,
-        },
-        // 密码只在保存时交给后端写钥匙串
-        conn.password || undefined,
-      );
+      const list = await api.saveConnection({
+        id: conn.id,
+        name: connName.trim() || `${conn.host}:${conn.port}`,
+        host: conn.host,
+        port: conn.port,
+        username: conn.username,
+        password: conn.password ?? "",
+        use_tls: !!conn.use_tls,
+        last_schema: null,
+      });
       onSaved(list);
     } finally {
       setSaving(false);
@@ -108,8 +105,7 @@ export function TablePane({
       const r = await api.testConnection(conn);
       setTestResult({ ok: true, version: r.version, schemas: r.schemas });
       if (conn.password) {
-        await api.savePassword(conn.id, conn.password);
-        onConnChange({ ...conn, passwordSaved: true, connection_id: conn.id });
+        onConnChange({ ...conn, passwordSaved: true });
       }
       // 连上后收起表单，把空间还给表清单
       setShowConn(false);

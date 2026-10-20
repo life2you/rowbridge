@@ -12,7 +12,7 @@ interface Draft {
   username: string;
   password: string;
   use_tls: boolean;
-  /** 已保存的数据源密码在钥匙串里，这里为空 */
+  /** 已保存的数据源密码从配置文件里读出来，直接填在表单里 */
   hasPassword: boolean;
 }
 
@@ -36,9 +36,10 @@ function fromSaved(c: SavedConnection): Draft {
     host: c.host,
     port: c.port,
     username: c.username,
-    password: "",
+    // 密码就在 connections.json 里，直接显示在表单
+    password: c.password ?? "",
     use_tls: c.use_tls,
-    hasPassword: true,
+    hasPassword: !!c.password,
   };
 }
 
@@ -101,22 +102,20 @@ export function DataSourceManager({
     setSaving(true);
     setError(null);
     try {
-      const next = await api.saveConnection(
-        {
-          id: editing.id,
-          name: editing.name.trim(),
-          host: editing.host.trim(),
-          port: editing.port,
-          username: editing.username.trim(),
-          use_tls: editing.use_tls,
-          last_schema: null,
-        },
-        editing.password || undefined,
-      );
+      const next = await api.saveConnection({
+        id: editing.id,
+        name: editing.name.trim(),
+        host: editing.host.trim(),
+        port: editing.port,
+        username: editing.username.trim(),
+        password: editing.password,
+        use_tls: editing.use_tls,
+        last_schema: null,
+      });
       onChange(next);
-      // 保存后保持编辑态，方便继续改。只是把「密码已存在」标记上。
+      // 保存后保持编辑态，方便继续改
       setEditing((d) =>
-        d ? { ...d, hasPassword: d.hasPassword || !!d.password, password: "" } : d,
+        d ? { ...d, hasPassword: !!d.password } : d,
       );
     } catch (e) {
       setError(errorMessage(e));
@@ -239,7 +238,7 @@ export function DataSourceManager({
               <div>
                 数据源保存在 <span className="mono text-[var(--color-text)]">~/.RowBridge/connections.json</span>
                 <br />
-                密码单独存 macOS 钥匙串，不写进文件。
+                密码和配置放在一起，都在这个文件里。
               </div>
             )}
           </div>
@@ -287,14 +286,14 @@ export function DataSourceManager({
                 </Field>
                 <Field
                   label="密码"
-                  hint={editing.hasPassword ? "已存在钥匙串，留空则沿用" : undefined}
+                  hint={editing.hasPassword ? "已在配置文件中" : undefined}
                 >
                   <input
                     data-testid="ds-password"
                     type="password"
                     value={editing.password}
                     onChange={(e) => set("password", e.target.value)}
-                    placeholder={editing.hasPassword ? "••••••" : ""}
+                    placeholder=""
                   />
                 </Field>
               </div>
@@ -348,7 +347,7 @@ export function DataSourceManager({
               <div className="mt-1 rounded-lg border border-[var(--color-border)] bg-[var(--color-panel)] p-2.5 text-[11px] leading-relaxed text-[var(--color-muted)]">
                 名称、主机、端口、用户名会存到{" "}
                 <span className="mono text-[var(--color-text)]">~/.RowBridge/connections.json</span>
-                ；密码只写 macOS 钥匙串，不落文件。
+                ；密码和配置放在同一个文件里，权限 700。
               </div>
             </div>
           </div>
@@ -362,7 +361,7 @@ export function DataSourceManager({
             <div className="text-[13px] font-semibold">删除这个数据源？</div>
             <div className="mt-1.5 text-[11.5px] leading-relaxed text-[var(--color-muted)]">
               「{list.find((c) => c.id === confirmDelete)?.name}」会从配置里移除，
-              钥匙串里的密码也一并删除。已同步的数据不受影响。
+              配置文件里的密码也一并删除。已同步的数据不受影响。
             </div>
             <div className="mt-3 flex justify-end gap-2">
               <Button onClick={() => setConfirmDelete(null)} className="!py-1">

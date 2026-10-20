@@ -18,7 +18,6 @@ use tauri::State;
 use tokio::sync::Mutex;
 use tokio_util::sync::CancellationToken;
 
-use crate::secrets;
 
 pub struct AppState {
     /// 正在运行的任务：taskId → 取消令牌
@@ -53,7 +52,12 @@ impl ConnForm {
         let password = match &self.password {
             Some(p) if !p.is_empty() => p.clone(),
             _ => match &self.connection_id {
-                Some(id) => secrets::get_password(id).unwrap_or_default(),
+                // 密码在 ~/.RowBridge/connections.json 里，按 id 找
+                Some(id) => crate::connections::list()
+                    .ok()
+                    .and_then(|l| l.into_iter().find(|c| c.id == *id))
+                    .map(|c| c.password)
+                    .unwrap_or_default(),
                 None => String::new(),
             },
         };
@@ -440,23 +444,6 @@ pub async fn cancel_sync(
     }
 }
 
-// ---------------------------------------------------------------- 密钥
-
-#[tauri::command]
-pub fn save_password(connection_id: String, password: String) -> Result<(), String> {
-    secrets::set_password(&connection_id, &password)
-}
-
-#[tauri::command]
-pub fn delete_password(connection_id: String) -> Result<(), String> {
-    secrets::delete_password(&connection_id)
-}
-
-#[tauri::command]
-pub fn has_password(connection_id: String) -> bool {
-    secrets::get_password(&connection_id).map(|p| !p.is_empty()).unwrap_or(false)
-}
-
 // ---------------------------------------------------------------- 历史
 
 #[tauri::command]
@@ -481,15 +468,12 @@ pub fn list_connections() -> Result<Vec<crate::connections::SavedConnection>, St
     crate::connections::list()
 }
 
-/// 保存数据源；密码写钥匙串，配置写 ~/.RowBridge/connections.json。
+/// 保存数据源。密码直接存 ~/.RowBridge/connections.json，
+/// 不再走钥匙串（用户反馈每次弹授权框太烦）。
 #[tauri::command]
 pub fn save_connection(
     conn: crate::connections::SavedConnection,
-    password: Option<String>,
 ) -> Result<Vec<crate::connections::SavedConnection>, String> {
-    if let Some(p) = password.as_ref().filter(|p| !p.is_empty()) {
-        secrets::set_password(&conn.id, p)?;
-    }
     crate::connections::upsert(conn)
 }
 
@@ -497,7 +481,6 @@ pub fn save_connection(
 pub fn remove_connection(
     connection_id: String,
 ) -> Result<Vec<crate::connections::SavedConnection>, String> {
-    let _ = secrets::delete_password(&connection_id);
     crate::connections::remove(&connection_id)
 }
 

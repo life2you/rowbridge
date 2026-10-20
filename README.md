@@ -103,8 +103,7 @@ GRANT SELECT, INSERT, UPDATE, CREATE ON db_b.* TO 'user'@'host';
 └── rowbridge.db       # 任务历史与日志
 ```
 
-密码**不在这些文件里**，只存 macOS 钥匙串（Keychain），以数据源 id 为键。
-`connections.json` 就是普通 JSON，可以手工改、可以纳入你自己的备份：
+密码**和配置放在一起**，也在 `connections.json` 里（用户明确要求，不走钥匙串——每次弹授权框太烦）。文件权限 700，只有你本人可读。可以手工改、可以纳入你自己的备份：
 
 ```json
 {
@@ -115,6 +114,7 @@ GRANT SELECT, INSERT, UPDATE, CREATE ON db_b.* TO 'user'@'host';
       "host": "10.0.0.8",
       "port": 3306,
       "username": "reader",
+      "password": "your-password",
       "use_tls": false,
       "last_schema": "orders"
     }

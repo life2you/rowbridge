@@ -44,23 +44,10 @@ export const api = {
 
   cancelSync: (taskId: string) => invoke<boolean>("cancel_sync", { taskId }),
 
-  savePassword: (connectionId: string, password: string) =>
-    invoke<void>("save_password", { connectionId, password }),
-
-  deletePassword: (connectionId: string) =>
-    invoke<void>("delete_password", { connectionId }),
-
-  hasPassword: (connectionId: string) =>
-    invoke<boolean>("has_password", { connectionId }),
-
   listConnections: () => invoke<SavedConnection[]>("list_connections"),
 
-  /** 保存数据源；password 只在此时传给后端写钥匙串 */
-  saveConnection: (conn: SavedConnection, password?: string) =>
-    invoke<SavedConnection[]>("save_connection", {
-      conn,
-      password: password ?? null,
-    }),
+  saveConnection: (conn: SavedConnection) =>
+    invoke<SavedConnection[]>("save_connection", { conn }),
 
   removeConnection: (connectionId: string) =>
     invoke<SavedConnection[]>("remove_connection", { connectionId }),

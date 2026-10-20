@@ -101,6 +101,8 @@ export interface SavedConnection {
   host: string;
   port: number;
   username: string;
+  /** 明文保存在 ~/.RowBridge/connections.json（用户要求，不再用钥匙串） */
+  password: string;
   use_tls: boolean;
   last_schema: string | null;
 }

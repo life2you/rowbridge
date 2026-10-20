@@ -4,7 +4,7 @@ import type { ConnForm } from "../lib/types";
 import { Badge, Button, Field, Spinner } from "./ui";
 
 export interface ConnectionDraft extends ConnForm {
-  /** 本地草稿 id，用于关联钥匙串 */
+  /** 本地草稿 id，用于关联已保存的数据源 */
   id: string;
   label: string;
   passwordSaved: boolean;
@@ -51,9 +51,9 @@ export function ConnectionEditor({
     try {
       const r = await api.testConnection(value);
       setResult({ ok: true, version: r.version, schemas: r.schemas });
+      // 标记密码已可用，后续请求从 connections.json 里取。
       if (value.password) {
-        await api.savePassword(value.id, value.password);
-        onChange({ ...value, passwordSaved: true, connection_id: value.id });
+        onChange({ ...value, passwordSaved: true });
       }
     } catch (e) {
       setResult({ ok: false, error: errorMessage(e) });
@@ -80,7 +80,7 @@ export function ConnectionEditor({
             v{result.version} · {result.schemas} 库
           </Badge>
         )}
-        {value.passwordSaved && !result && <Badge tone="accent">密码已存钥匙串</Badge>}
+        {value.passwordSaved && !result && <Badge tone="accent">已保存数据源</Badge>}
       </div>
 
       <div className="grid grid-cols-[1fr_84px] gap-2">

@@ -15,6 +15,10 @@ pub struct SavedConnection {
     pub host: String,
     pub port: u16,
     pub username: String,
+    /// 明文保存在 connections.json。用户明确要求不再走钥匙串
+    /// （每次弹授权框太烦）。文件权限 700，与内网凭据的安全等级一致。
+    #[serde(default)]
+    pub password: String,
     #[serde(default)]
     pub use_tls: bool,
     /// 这个数据源最近一次用的库，重新选中时自动带上
@@ -104,4 +108,28 @@ pub fn remember_schema(id: &str, schema: &str) -> Result<(), String> {
         }
     }
     Ok(())
+}
+
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn password_roundtrips_in_json() {
+        let c = SavedConnection {
+            id: "t1".into(),
+            name: "测试".into(),
+            host: "127.0.0.1".into(),
+            port: 3307,
+            username: "root".into(),
+            password: "root123".into(),
+            use_tls: false,
+            last_schema: None,
+        };
+        let json = serde_json::to_string_pretty(&c).unwrap();
+        assert!(json.contains("root123"), "密码必须在 JSON 里: {json}");
+        let back: SavedConnection = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.password, "root123");
+    }
 }

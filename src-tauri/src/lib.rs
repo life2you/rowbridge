@@ -1,6 +1,5 @@
 mod commands;
 mod connections;
-mod secrets;
 mod store;
 
 use std::sync::Arc;
@@ -35,9 +34,6 @@ pub fn run() {
             commands::preflight,
             commands::start_sync,
             commands::cancel_sync,
-            commands::save_password,
-            commands::delete_password,
-            commands::has_password,
             commands::list_tasks,
             commands::task_logs,
             commands::list_connections,
