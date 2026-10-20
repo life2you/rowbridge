@@ -30,6 +30,7 @@ export function TablePane({
   saved,
   onPickSaved,
   onDeleteSaved,
+  onSaved,
 }: {
   side: "src" | "dst";
   conn: ConnectionDraft;
@@ -50,6 +51,8 @@ export function TablePane({
   saved: SavedConnection[];
   onPickSaved: (c: SavedConnection) => void;
   onDeleteSaved: (id: string) => void;
+  /** 保存后回传最新列表，父组件刷新下拉 */
+  onSaved: (list: SavedConnection[]) => void;
 }) {
   const [showConn, setShowConn] = useState(false);
   const [filter, setFilter] = useState("");
@@ -76,17 +79,20 @@ export function TablePane({
   async function handleSave() {
     setSaving(true);
     try {
-      await api.saveConnection({
-        id: conn.id,
-        name: connName.trim() || `${conn.host}:${conn.port}`,
-        host: conn.host,
-        port: conn.port,
-        username: conn.username,
-        use_tls: !!conn.use_tls,
-        last_src_schema: null,
-        last_dst_schema: null,
-        updated_at: Date.now(),
-      });
+      const list = await api.saveConnection(
+        {
+          id: conn.id,
+          name: connName.trim() || `${conn.host}:${conn.port}`,
+          host: conn.host,
+          port: conn.port,
+          username: conn.username,
+          use_tls: !!conn.use_tls,
+          last_schema: null,
+        },
+        // 密码只在保存时交给后端写钥匙串
+        conn.password || undefined,
+      );
+      onSaved(list);
     } finally {
       setSaving(false);
     }

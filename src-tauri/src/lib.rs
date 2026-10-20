@@ -1,4 +1,5 @@
 mod commands;
+mod connections;
 mod secrets;
 mod store;
 
@@ -14,6 +15,9 @@ pub fn run() {
         .plugin(tauri_plugin_dialog::init())
         .manage(Arc::new(AppState::default()))
         .setup(|app| {
+            if let Err(e) = connections::init() {
+                eprintln!("初始化配置目录失败: {e}");
+            }
             if let Err(e) = store::init(app.handle()) {
                 eprintln!("本地数据库初始化失败: {e}");
             }
@@ -39,10 +43,9 @@ pub fn run() {
             commands::list_connections,
             commands::save_connection,
             commands::remove_connection,
-            commands::touch_connection,
-            commands::get_session,
-            commands::save_session,
-            commands::clear_session,
+            commands::remember_schema,
+            commands::connections_path,
+            commands::reveal_config_dir,
         ])
         .run(tauri::generate_context!())
         .expect("RowBridge 启动失败");

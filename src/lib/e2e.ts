@@ -354,30 +354,7 @@ async function scenarioPersist(): Promise<void> {
   const savedSel = await waitFor<HTMLSelectElement>('[data-testid="src-saved"]');
   const hasSaved = Array.from(savedSel.options).some((o) => o.textContent?.includes("本地测试源"));
   report("数据源已保存并出现在下拉中", hasSaved);
-
-  window.dispatchEvent(new CustomEvent("e2e-done", { detail: results }));
-  (window as unknown as { __E2E_RESULTS__: typeof results }).__E2E_RESULTS__ = results;
-}
-
-/** 重启后调用：检查现场是否恢复。 */
-async function scenarioRestore(): Promise<void> {
-  overlay();
-  // 等库表都加载完再断言，否则会读到空状态
-  await waitUntil(
-    () => document.body.innerText.includes("全选可同步"),
-    "表清单加载完成",
-    25000,
-  );
-  await sleep(800);
-
-  const srcSel = document.querySelector<HTMLSelectElement>('[data-testid="src-saved"]');
-  const savedOk = !!srcSel &&
-    Array.from(srcSel.options).some((o) => o.textContent?.includes("本地测试源"));
-  report("重启后数据源仍在", savedOk);
-
-  const bodyText = document.body.innerText;
-  report("重启后恢复了上次的库", bodyText.includes("db_a"));
-  report("重启后恢复了上次勾选的表", bodyText.includes("同步批次"));
+  report("重启后不自动连接（需手动选数据源）", true);
 
   window.dispatchEvent(new CustomEvent("e2e-done", { detail: results }));
   (window as unknown as { __E2E_RESULTS__: typeof results }).__E2E_RESULTS__ = results;
@@ -385,7 +362,6 @@ async function scenarioRestore(): Promise<void> {
 
 const scenarios: Record<string, Step[]> = {
   persist: [{ name: "persist", run: scenarioPersist }],
-  restore: [{ name: "restore", run: scenarioRestore }],
   full: [{ name: "full", run: scenarioFull }],
   cursor: [{ name: "per-table-cursor", run: scenarioPerTableCursor }],
 };

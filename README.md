@@ -36,7 +36,7 @@ LIMIT ?                 -- 必须
 
 | 能力 | 说明 |
 |---|---|
-| 连接管理 | 连接信息压成一行，点「切换」才展开；密码存 macOS 钥匙串，不落盘 |
+| 连接管理 | 数据源可命名保存，下拉直接切换；密码存 macOS 钥匙串，配置存 `~/.RowBridge/` |
 | 库表浏览 | 库 → 表，显示主键、行数估算，不兼容的表置灰并说明原因 |
 | 结构预检 | 主键合法性、列兼容性、collation 差异、目标缺列、触发器 |
 | 自动建表 | `SHOW CREATE TABLE` → 改写 → 执行，改写细节可视化 |
@@ -94,6 +94,35 @@ GRANT SELECT ON db_a.* TO 'user'@'%';
 -- 目标端（需要自动建表和建库时）
 GRANT SELECT, INSERT, UPDATE, CREATE ON db_b.* TO 'user'@'host';
 ```
+
+## 配置存放位置
+
+```
+~/.RowBridge/
+├── connections.json   # 数据源（主机/端口/用户名），可直接编辑或备份
+└── rowbridge.db       # 任务历史与日志
+```
+
+密码**不在这些文件里**，只存 macOS 钥匙串（Keychain），以数据源 id 为键。
+`connections.json` 就是普通 JSON，可以手工改、可以纳入你自己的备份：
+
+```json
+{
+  "connections": [
+    {
+      "id": "conn_1792488333305_qcaq8",
+      "name": "生产库只读",
+      "host": "10.0.0.8",
+      "port": 3306,
+      "username": "reader",
+      "use_tls": false,
+      "last_schema": "orders"
+    }
+  ]
+}
+```
+
+应用启动时**不会自动连接**，需要在下拉里选一个数据源。
 
 ## 安装
 

@@ -102,31 +102,7 @@ export interface SavedConnection {
   port: number;
   username: string;
   use_tls: boolean;
-  last_src_schema: string | null;
-  last_dst_schema: string | null;
-  updated_at: number;
-}
-
-/** 界面现场：退出后能恢复上次的连接和选表 */
-export interface AppSession {
-  src?: {
-    id: string;
-    host: string;
-    port: number;
-    username: string;
-    passwordSaved: boolean;
-    schema: string | null;
-  } | null;
-  dst?: {
-    id: string;
-    host: string;
-    port: number;
-    username: string;
-    passwordSaved: boolean;
-    schema: string | null;
-  } | null;
-  selectedTables?: string[];
-  overrides?: Record<string, unknown>;
+  last_schema: string | null;
 }
 
 export interface TestResult {

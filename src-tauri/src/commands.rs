@@ -474,46 +474,52 @@ pub fn task_logs(
 }
 
 
-// ---------------------------------------------------------------- 数据源持久化
+// ---------------------------------------------------------------- 数据源
 
 #[tauri::command]
-pub fn list_connections() -> Result<Vec<crate::store::SavedConnection>, String> {
-    crate::store::list_connections()
+pub fn list_connections() -> Result<Vec<crate::connections::SavedConnection>, String> {
+    crate::connections::list()
+}
+
+/// 保存数据源；密码写钥匙串，配置写 ~/.RowBridge/connections.json。
+#[tauri::command]
+pub fn save_connection(
+    conn: crate::connections::SavedConnection,
+    password: Option<String>,
+) -> Result<Vec<crate::connections::SavedConnection>, String> {
+    if let Some(p) = password.as_ref().filter(|p| !p.is_empty()) {
+        secrets::set_password(&conn.id, p)?;
+    }
+    crate::connections::upsert(conn)
 }
 
 #[tauri::command]
-pub fn save_connection(conn: crate::store::SavedConnection) -> Result<(), String> {
-    crate::store::upsert_connection(&conn)
-}
-
-#[tauri::command]
-pub fn remove_connection(connection_id: String) -> Result<(), String> {
-    crate::store::delete_connection(&connection_id)?;
-    // 连带清掉钥匙串里的密码，避免残留
+pub fn remove_connection(
+    connection_id: String,
+) -> Result<Vec<crate::connections::SavedConnection>, String> {
     let _ = secrets::delete_password(&connection_id);
-    Ok(())
+    crate::connections::remove(&connection_id)
 }
 
 #[tauri::command]
-pub fn touch_connection(connection_id: String) -> Result<(), String> {
-    crate::store::touch_connection(&connection_id)
-}
-
-/// 记住界面现场：上次用的连接、库、勾了哪些表。
-#[tauri::command]
-pub fn get_session() -> Result<serde_json::Value, String> {
-    Ok(match crate::store::get_state("session") {
-        Some(v) => serde_json::from_str(&v).unwrap_or(serde_json::Value::Null),
-        None => serde_json::Value::Null,
-    })
+pub fn remember_schema(connection_id: String, schema: String) -> Result<(), String> {
+    crate::connections::remember_schema(&connection_id, &schema)
 }
 
 #[tauri::command]
-pub fn save_session(session: serde_json::Value) -> Result<(), String> {
-    crate::store::set_state("session", &session.to_string())
+pub fn connections_path() -> Result<String, String> {
+    Ok(crate::connections::config_dir()?
+        .join("connections.json")
+        .display()
+        .to_string())
 }
 
+/// 在 Finder 里打开配置目录，方便用户查看/备份。
 #[tauri::command]
-pub fn clear_session() -> Result<(), String> {
-    crate::store::clear_state("session")
+pub fn reveal_config_dir(app: tauri::AppHandle) -> Result<(), String> {
+    use tauri_plugin_opener::OpenerExt;
+    let dir = crate::connections::config_dir()?;
+    app.opener()
+        .open_path(dir.display().to_string(), None::<&str>)
+        .map_err(|e| e.to_string())
 }

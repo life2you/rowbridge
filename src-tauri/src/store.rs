@@ -8,7 +8,6 @@ use std::sync::OnceLock;
 use rowbridge_core::engine::{Event, TaskReport};
 use rusqlite::{params, Connection};
 use serde::Serialize;
-use tauri::Manager;
 
 static DB_PATH: OnceLock<std::path::PathBuf> = OnceLock::new();
 
@@ -20,10 +19,9 @@ fn path() -> std::path::PathBuf {
 
 /// 启动时调用一次。
 pub fn init(app: &tauri::AppHandle) -> Result<(), String> {
-    let dir = app
-        .path()
-        .app_data_dir()
-        .map_err(|e| format!("无法定位应用数据目录: {e}"))?;
+    let _ = app;
+    // 统一放在 ~/.RowBridge，用户好找也好备份
+    let dir = crate::connections::config_dir()?;
     std::fs::create_dir_all(&dir).map_err(|e| format!("创建数据目录失败: {e}"))?;
     let db = dir.join("rowbridge.db");
     let _ = DB_PATH.set(db.clone());
@@ -57,22 +55,6 @@ pub fn init(app: &tauri::AppHandle) -> Result<(), String> {
         );
         CREATE INDEX IF NOT EXISTS idx_logs_task ON task_logs(task_id, id);
 
-        CREATE TABLE IF NOT EXISTS connections (
-            id TEXT PRIMARY KEY,
-            name TEXT NOT NULL,
-            host TEXT NOT NULL,
-            port INTEGER NOT NULL,
-            username TEXT NOT NULL,
-            use_tls INTEGER NOT NULL DEFAULT 0,
-            updated_at INTEGER NOT NULL
-        );
-
-        -- 应用级键值：记住上次用的源/目标连接与库，退出重开能恢复现场
-        CREATE TABLE IF NOT EXISTS app_state (
-            key TEXT PRIMARY KEY,
-            value TEXT NOT NULL,
-            updated_at INTEGER NOT NULL
-        );
         "#,
     )
     .map_err(|e| format!("初始化表结构失败: {e}"))?;
@@ -255,132 +237,4 @@ pub fn task_logs(
         })
         .map_err(|e| e.to_string())?;
     rows.collect::<Result<Vec<_>, _>>().map_err(|e| e.to_string())
-}
-
-
-// ---------------------------------------------------------------- 连接持久化
-
-#[derive(Debug, Clone, Serialize, serde::Deserialize)]
-pub struct SavedConnection {
-    pub id: String,
-    pub name: String,
-    pub host: String,
-    pub port: u16,
-    pub username: String,
-    #[serde(default)]
-    pub use_tls: bool,
-    #[serde(default)]
-    pub last_src_schema: Option<String>,
-    #[serde(default)]
-    pub last_dst_schema: Option<String>,
-    pub updated_at: i64,
-}
-
-pub fn list_connections() -> Result<Vec<SavedConnection>, String> {
-    let conn = open()?;
-    let mut stmt = conn
-        .prepare(
-            "SELECT id, name, host, port, username, use_tls, updated_at
-             FROM connections ORDER BY updated_at DESC",
-        )
-        .map_err(|e| e.to_string())?;
-    let rows = stmt
-        .query_map([], |r| {
-            Ok(SavedConnection {
-                id: r.get(0)?,
-                name: r.get(1)?,
-                host: r.get(2)?,
-                port: r.get::<_, i64>(3)? as u16,
-                username: r.get(4)?,
-                use_tls: r.get::<_, i32>(5)? != 0,
-                last_src_schema: None,
-                last_dst_schema: None,
-                updated_at: r.get(6)?,
-            })
-        })
-        .map_err(|e| e.to_string())?;
-    let mut out: Vec<SavedConnection> = rows.collect::<Result<_, _>>().map_err(|e| e.to_string())?;
-
-    // 补上各自最近用过的库
-    for c in &mut out {
-        c.last_src_schema = get_state(&format!("conn:{}:src_schema", c.id));
-        c.last_dst_schema = get_state(&format!("conn:{}:dst_schema", c.id));
-    }
-    Ok(out)
-}
-
-pub fn upsert_connection(c: &SavedConnection) -> Result<(), String> {
-    let conn = open()?;
-    conn.execute(
-        "INSERT INTO connections (id, name, host, port, username, use_tls, updated_at)
-         VALUES (?,?,?,?,?,?,?)
-         ON CONFLICT(id) DO UPDATE SET
-           name=excluded.name, host=excluded.host, port=excluded.port,
-           username=excluded.username, use_tls=excluded.use_tls,
-           updated_at=excluded.updated_at",
-        params![
-            c.id,
-            c.name,
-            c.host,
-            c.port,
-            c.username,
-            c.use_tls as i32,
-            now_ms()
-        ],
-    )
-    .map_err(|e| e.to_string())?;
-    Ok(())
-}
-
-pub fn delete_connection(conn_id: &str) -> Result<(), String> {
-    let conn = open()?;
-    conn.execute("DELETE FROM connections WHERE id = ?", params![conn_id])
-        .map_err(|e| e.to_string())?;
-    conn.execute(
-        "DELETE FROM app_state WHERE key LIKE ?",
-        params![format!("conn:{conn_id}:%")],
-    )
-    .map_err(|e| e.to_string())?;
-    Ok(())
-}
-
-/// 连接最后一次成功使用的时间，用于「最近使用」排序。
-pub fn touch_connection(conn_id: &str) -> Result<(), String> {
-    let conn = open()?;
-    conn.execute(
-        "UPDATE connections SET updated_at = ? WHERE id = ?",
-        params![now_ms(), conn_id],
-    )
-    .map_err(|e| e.to_string())?;
-    Ok(())
-}
-
-// ---------------------------------------------------------------- 应用状态
-
-pub fn get_state(key: &str) -> Option<String> {
-    let conn = open().ok()?;
-    conn.query_row(
-        "SELECT value FROM app_state WHERE key = ?",
-        params![key],
-        |r| r.get::<_, String>(0),
-    )
-    .ok()
-}
-
-pub fn set_state(key: &str, value: &str) -> Result<(), String> {
-    let conn = open()?;
-    conn.execute(
-        "INSERT INTO app_state (key, value, updated_at) VALUES (?,?,?)
-         ON CONFLICT(key) DO UPDATE SET value=excluded.value, updated_at=excluded.updated_at",
-        params![key, value, now_ms()],
-    )
-    .map_err(|e| e.to_string())?;
-    Ok(())
-}
-
-pub fn clear_state(key: &str) -> Result<(), String> {
-    let conn = open()?;
-    conn.execute("DELETE FROM app_state WHERE key = ?", params![key])
-        .map_err(|e| e.to_string())?;
-    Ok(())
 }

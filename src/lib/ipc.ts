@@ -10,7 +10,6 @@ import type {
   TableRow,
   TaskReport,
   SavedConnection,
-  AppSession,
   TaskSummary,
   TestResult,
 } from "./types";
@@ -56,21 +55,22 @@ export const api = {
 
   listConnections: () => invoke<SavedConnection[]>("list_connections"),
 
-  saveConnection: (conn: SavedConnection) =>
-    invoke<void>("save_connection", { conn }),
+  /** 保存数据源；password 只在此时传给后端写钥匙串 */
+  saveConnection: (conn: SavedConnection, password?: string) =>
+    invoke<SavedConnection[]>("save_connection", {
+      conn,
+      password: password ?? null,
+    }),
 
   removeConnection: (connectionId: string) =>
-    invoke<void>("remove_connection", { connectionId }),
+    invoke<SavedConnection[]>("remove_connection", { connectionId }),
 
-  touchConnection: (connectionId: string) =>
-    invoke<void>("touch_connection", { connectionId }),
+  rememberSchema: (connectionId: string, schema: string) =>
+    invoke<void>("remember_schema", { connectionId, schema }),
 
-  getSession: () => invoke<AppSession | null>("get_session"),
+  connectionsPath: () => invoke<string>("connections_path"),
 
-  saveSession: (session: AppSession) =>
-    invoke<void>("save_session", { session }),
-
-  clearSession: () => invoke<void>("clear_session"),
+  revealConfigDir: () => invoke<void>("reveal_config_dir"),
 
   listTasks: () => invoke<TaskSummary[]>("list_tasks"),
 
