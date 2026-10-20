@@ -31,6 +31,7 @@ export function TablePane({
   onPickSaved,
   onDeleteSaved,
   onSaved,
+  onManage,
 }: {
   side: "src" | "dst";
   conn: ConnectionDraft;
@@ -53,6 +54,8 @@ export function TablePane({
   onDeleteSaved: (id: string) => void;
   /** 保存后回传最新列表，父组件刷新下拉 */
   onSaved: (list: SavedConnection[]) => void;
+  /** 打开数据源管理面板 */
+  onManage: () => void;
 }) {
   const [showConn, setShowConn] = useState(false);
   const [filter, setFilter] = useState("");
@@ -143,6 +146,10 @@ export function TablePane({
           value={saved.some((c) => c.id === conn.id) ? conn.id : ""}
           disabled={disabled}
           onChange={(e) => {
+            if (e.target.value === "__manage__") {
+              onManage();
+              return;
+            }
             const c = saved.find((x) => x.id === e.target.value);
             if (c) onPickSaved(c);
           }}
@@ -158,6 +165,7 @@ export function TablePane({
               {c.name} · {c.host}:{c.port}
             </option>
           ))}
+          <option value="__manage__">＋ 管理数据源…</option>
         </select>
         {testResult?.ok && (
           <Badge tone="ok">

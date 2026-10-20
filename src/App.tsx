@@ -19,6 +19,7 @@ import {
 } from "./components/ConnectionEditor";
 import { TablePane } from "./components/TablePane";
 import { BatchView } from "./components/BatchView";
+import { DataSourceManager } from "./components/DataSourceManager";
 import { RunDrawer } from "./components/RunDrawer";
 import { HistoryPanel } from "./components/HistoryPanel";
 import { Badge } from "./components/ui";
@@ -80,6 +81,7 @@ export default function App() {
   const [startError, setStartError] = useState<string | null>(null);
   const [drawerOpen, setDrawerOpen] = useState(false);
   const [showHistory, setShowHistory] = useState(false);
+  const [showDataSources, setShowDataSources] = useState(false);
 
   const srcConn = toConnForm(src);
   const dstConn = toConnForm(dst);
@@ -306,7 +308,26 @@ export default function App() {
           {run.running && <Badge tone="accent">同步中</Badge>}
           <button
             type="button"
-            onClick={() => setShowHistory((v) => !v)}
+            data-testid="nav-datasources"
+            onClick={() => {
+              setShowDataSources((v) => !v);
+              setShowHistory(false);
+            }}
+            className={cn(
+              "rounded px-2 py-1 text-[12px]",
+              showDataSources
+                ? "bg-[#232a38] text-[var(--color-text)]"
+                : "text-[var(--color-muted)] hover:text-[var(--color-text)]",
+            )}
+          >
+            数据源
+          </button>
+          <button
+            type="button"
+            onClick={() => {
+              setShowHistory((v) => !v);
+              setShowDataSources(false);
+            }}
             className={cn(
               "rounded px-2 py-1 text-[12px]",
               showHistory
@@ -319,7 +340,15 @@ export default function App() {
         </div>
       </header>
 
-      {showHistory ? (
+      {showDataSources ? (
+        <div className="min-h-0 flex-1">
+          <DataSourceManager
+            list={savedConns}
+            onChange={setSavedConns}
+            onClose={() => setShowDataSources(false)}
+          />
+        </div>
+      ) : showHistory ? (
         <div className="min-h-0 flex-1">
           <HistoryPanel />
         </div>
@@ -345,6 +374,7 @@ export default function App() {
               onPickSaved={(c) => pickSaved("src", c)}
               onDeleteSaved={deleteSaved}
               onSaved={setSavedConns}
+              onManage={() => setShowDataSources(true)}
             />
 
             <div className="relative flex min-w-[560px] flex-1 flex-col">
@@ -397,6 +427,7 @@ export default function App() {
               onPickSaved={(c) => pickSaved("dst", c)}
               onDeleteSaved={deleteSaved}
               onSaved={setSavedConns}
+              onManage={() => setShowDataSources(true)}
             />
           </div>
 

@@ -360,7 +360,72 @@ async function scenarioPersist(): Promise<void> {
   (window as unknown as { __E2E_RESULTS__: typeof results }).__E2E_RESULTS__ = results;
 }
 
+/** 数据源管理：新增 → 编辑 → 删除，全链路验证。 */
+async function scenarioDataSource(): Promise<void> {
+  overlay();
+  await sleep(1500);
+
+  // 打开数据源面板
+  (await waitFor<HTMLButtonElement>('[data-testid="nav-datasources"]')).click();
+  await sleep(500);
+  report("数据源面板可打开", !!document.querySelector('[data-testid="ds-add"]'));
+
+  // 新增
+  (await waitFor<HTMLButtonElement>('[data-testid="ds-add"]')).click();
+  await sleep(300);
+  setInput(await waitFor<HTMLInputElement>('[data-testid="ds-name"]'), "本地测试源");
+  setInput(await waitFor<HTMLInputElement>('[data-testid="ds-host"]'), "127.0.0.1");
+  setInput(await waitFor<HTMLInputElement>('[data-testid="ds-port"]'), "3307");
+  setInput(await waitFor<HTMLInputElement>('[data-testid="ds-password"]'), "root123");
+  await sleep(200);
+
+  // 测试连接
+  (await waitFor<HTMLButtonElement>('[data-testid="ds-test"]')).click();
+  await waitUntil(
+    () => document.body.innerText.includes("个库"),
+    "连接测试通过",
+    20000,
+  );
+  report("连接测试通过", true);
+
+  // 保存
+  (await waitFor<HTMLButtonElement>('[data-testid="ds-save"]')).click();
+  await waitUntil(
+    () => document.body.innerText.includes("127.0.0.1:3307"),
+    "数据源出现在列表",
+    10000,
+  );
+  report("新增数据源成功", true);
+
+  // 编辑：改名
+  const nameInput = await waitFor<HTMLInputElement>('[data-testid="ds-name"]');
+  setInput(nameInput, "改名后的源");
+  await sleep(200);
+  (await waitFor<HTMLButtonElement>('[data-testid="ds-save"]')).click();
+  await waitUntil(
+    () => document.body.innerText.includes("改名后的源"),
+    "改名生效",
+    10000,
+  );
+  report("编辑数据源成功", true);
+
+  // 删除
+  const delBtn = Array.from(document.querySelectorAll("button")).find(
+    (b) => b.textContent?.trim() === "删除",
+  );
+  delBtn?.click();
+  await sleep(400);
+  (await waitFor<HTMLButtonElement>('[data-testid="ds-confirm-delete"]')).click();
+  await sleep(600);
+  const gone = !document.body.innerText.includes("改名后的源");
+  report("删除数据源成功", gone);
+
+  window.dispatchEvent(new CustomEvent("e2e-done", { detail: results }));
+  (window as unknown as { __E2E_RESULTS__: typeof results }).__E2E_RESULTS__ = results;
+}
+
 const scenarios: Record<string, Step[]> = {
+  datasource: [{ name: "datasource", run: scenarioDataSource }],
   persist: [{ name: "persist", run: scenarioPersist }],
   full: [{ name: "full", run: scenarioFull }],
   cursor: [{ name: "per-table-cursor", run: scenarioPerTableCursor }],
