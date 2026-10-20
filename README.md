@@ -95,6 +95,22 @@ GRANT SELECT ON db_a.* TO 'user'@'%';
 GRANT SELECT, INSERT, UPDATE, CREATE ON db_b.* TO 'user'@'host';
 ```
 
+## 安装
+
+```bash
+# Homebrew（推荐）
+brew install --cask life2you/tap/rowbridge
+
+# 或直接下载 dmg
+# https://github.com/life2you/rowbridge/releases
+```
+
+未做 Apple 开发者签名，若首次启动提示「已损坏」：
+
+```bash
+xattr -cr /Applications/RowBridge.app
+```
+
 ## 开发
 
 需要 Node 20+、Rust 1.88+、Xcode Command Line Tools。
