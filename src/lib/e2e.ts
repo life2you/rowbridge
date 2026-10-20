@@ -100,7 +100,7 @@ async function fillConnection(
   const toggle = await waitFor<HTMLButtonElement>(
     `[data-testid="${side}-toggle-conn"]`,
   );
-  if (toggle.textContent?.includes("切换")) toggle.click();
+  if (toggle.textContent?.includes("切换") || toggle.textContent?.includes("编辑")) toggle.click();
   await sleep(150);
 
   setInput(await waitFor<HTMLInputElement>(`[data-testid="${side}-host"]`), host);
@@ -317,7 +317,75 @@ async function scenarioPerTableCursor(): Promise<void> {
     results;
 }
 
+/** 验证数据源持久化：保存后重启应用，看是否还在。 */
+async function scenarioPersist(): Promise<void> {
+  overlay();
+
+  await fillConnection("src", "127.0.0.1", "3307", "root", "root123");
+  await fillConnection("dst", "127.0.0.1", "3308", "root", "root123");
+  await waitUntil(
+    () => document.body.innerText.includes("密码已存钥匙串") ||
+          document.body.innerText.includes("8.0"),
+    "连接成功",
+    20000,
+  );
+
+  // 展开源连接表单，填名称并保存
+  const toggle = await waitFor<HTMLButtonElement>('[data-testid="src-toggle-conn"]');
+  if (toggle.textContent?.includes("编辑")) toggle.click();
+  await sleep(300);
+
+  const nameInput = await waitFor<HTMLInputElement>('[data-testid="src-conn-name"]');
+  setInput(nameInput, "本地测试源");
+  await sleep(200);
+  const saveBtn = await waitFor<HTMLButtonElement>('[data-testid="src-save-conn"]');
+  await waitUntil(() => !saveBtn.disabled, "保存按钮可用", 10000);
+  saveBtn.click();
+  await sleep(800);
+
+  // 选库 + 勾表，让现场有内容
+  setSelect(await waitFor<HTMLSelectElement>('[data-testid="src-schema"]'), "db_a");
+  await waitFor('[data-testid="table-simple"]', 20000);
+  await sleep(300);
+  const cb = await waitFor<HTMLInputElement>('[data-testid="table-simple"]');
+  if (!cb.checked) cb.click();
+  await sleep(1200); // 等会话防抖保存
+
+  const savedSel = await waitFor<HTMLSelectElement>('[data-testid="src-saved"]');
+  const hasSaved = Array.from(savedSel.options).some((o) => o.textContent?.includes("本地测试源"));
+  report("数据源已保存并出现在下拉中", hasSaved);
+
+  window.dispatchEvent(new CustomEvent("e2e-done", { detail: results }));
+  (window as unknown as { __E2E_RESULTS__: typeof results }).__E2E_RESULTS__ = results;
+}
+
+/** 重启后调用：检查现场是否恢复。 */
+async function scenarioRestore(): Promise<void> {
+  overlay();
+  // 等库表都加载完再断言，否则会读到空状态
+  await waitUntil(
+    () => document.body.innerText.includes("全选可同步"),
+    "表清单加载完成",
+    25000,
+  );
+  await sleep(800);
+
+  const srcSel = document.querySelector<HTMLSelectElement>('[data-testid="src-saved"]');
+  const savedOk = !!srcSel &&
+    Array.from(srcSel.options).some((o) => o.textContent?.includes("本地测试源"));
+  report("重启后数据源仍在", savedOk);
+
+  const bodyText = document.body.innerText;
+  report("重启后恢复了上次的库", bodyText.includes("db_a"));
+  report("重启后恢复了上次勾选的表", bodyText.includes("同步批次"));
+
+  window.dispatchEvent(new CustomEvent("e2e-done", { detail: results }));
+  (window as unknown as { __E2E_RESULTS__: typeof results }).__E2E_RESULTS__ = results;
+}
+
 const scenarios: Record<string, Step[]> = {
+  persist: [{ name: "persist", run: scenarioPersist }],
+  restore: [{ name: "restore", run: scenarioRestore }],
   full: [{ name: "full", run: scenarioFull }],
   cursor: [{ name: "per-table-cursor", run: scenarioPerTableCursor }],
 };

@@ -472,3 +472,48 @@ pub fn task_logs(
 ) -> Result<Vec<crate::store::LogRow>, String> {
     crate::store::task_logs(app, &task_id, limit.unwrap_or(500))
 }
+
+
+// ---------------------------------------------------------------- 数据源持久化
+
+#[tauri::command]
+pub fn list_connections() -> Result<Vec<crate::store::SavedConnection>, String> {
+    crate::store::list_connections()
+}
+
+#[tauri::command]
+pub fn save_connection(conn: crate::store::SavedConnection) -> Result<(), String> {
+    crate::store::upsert_connection(&conn)
+}
+
+#[tauri::command]
+pub fn remove_connection(connection_id: String) -> Result<(), String> {
+    crate::store::delete_connection(&connection_id)?;
+    // 连带清掉钥匙串里的密码，避免残留
+    let _ = secrets::delete_password(&connection_id);
+    Ok(())
+}
+
+#[tauri::command]
+pub fn touch_connection(connection_id: String) -> Result<(), String> {
+    crate::store::touch_connection(&connection_id)
+}
+
+/// 记住界面现场：上次用的连接、库、勾了哪些表。
+#[tauri::command]
+pub fn get_session() -> Result<serde_json::Value, String> {
+    Ok(match crate::store::get_state("session") {
+        Some(v) => serde_json::from_str(&v).unwrap_or(serde_json::Value::Null),
+        None => serde_json::Value::Null,
+    })
+}
+
+#[tauri::command]
+pub fn save_session(session: serde_json::Value) -> Result<(), String> {
+    crate::store::set_state("session", &session.to_string())
+}
+
+#[tauri::command]
+pub fn clear_session() -> Result<(), String> {
+    crate::store::clear_state("session")
+}

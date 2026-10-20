@@ -1,7 +1,9 @@
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { api, errorMessage } from "./lib/ipc";
 import type {
+  AppSession,
   ConnForm,
+  SavedConnection,
   OptionsForm,
   PreflightReport,
   RunRequest,
@@ -40,6 +42,24 @@ const defaultOptions: OptionsForm = {
   continue_on_error: true,
 };
 
+function applySession(
+  prev: ConnectionDraft,
+  s: NonNullable<AppSession["src"]>,
+  side: "src" | "dst",
+): ConnectionDraft {
+  return {
+    ...prev,
+    id: s.id,
+    label: side === "src" ? "源连接" : "目标连接",
+    host: s.host,
+    port: s.port,
+    username: s.username,
+    password: "",
+    passwordSaved: s.passwordSaved,
+    connection_id: s.passwordSaved ? s.id : null,
+  };
+}
+
 function toConnForm(c: ConnectionDraft): ConnForm {
   return {
     host: c.host,
@@ -71,6 +91,11 @@ export default function App() {
   const [preflighting, setPreflighting] = useState(false);
   const [preflightError, setPreflightError] = useState<string | null>(null);
 
+  const [savedConns, setSavedConns] = useState<SavedConnection[]>([]);
+  const [sessionReady, setSessionReady] = useState(false);
+  // StrictMode 下 effect 会跑两次，用 ref 保证恢复现场只执行一次
+  const restoredRef = useRef(false);
+
   const [run, setRun] = useState<RunState>(emptyRun);
   const [taskId, setTaskId] = useState<string | null>(null);
   const [startError, setStartError] = useState<string | null>(null);
@@ -79,6 +104,38 @@ export default function App() {
 
   const srcConn = toConnForm(src);
   const dstConn = toConnForm(dst);
+
+  // ---- 启动时恢复上次的连接与选表 ----
+  useEffect(() => {
+    if (restoredRef.current) return;
+    restoredRef.current = true;
+    (async () => {
+      try {
+        const list = await api.listConnections();
+        setSavedConns(list);
+
+        const sess = await api.getSession();
+        if (sess?.src) {
+          setSrc((prev) => applySession(prev, sess.src!, "src"));
+          setSrcSchema(sess.src.schema);
+        }
+        if (sess?.dst) {
+          setDst((prev) => applySession(prev, sess.dst!, "dst"));
+          setDstSchema(sess.dst.schema);
+        }
+        if (sess?.selectedTables?.length) {
+          setSelected(new Set(sess.selectedTables));
+        }
+        if (sess?.overrides) {
+          setOverrides(sess.overrides as Record<string, TableCursor>);
+        }
+      } catch {
+        // 首次启动没有历史，忽略
+      } finally {
+        setSessionReady(true);
+      }
+    })();
+  }, []);
 
   // ---- 库列表 ----
   useEffect(() => {
@@ -135,6 +192,80 @@ export default function App() {
     setReport(null);
     setPreflightError(null);
   }, [srcSchema, dstSchema, selected, options, overrides]);
+
+  // ---- 现场自动保存（防抖，避免每次输入都写库）----
+  // 恢复完成后的第一次不保存：此时 srcSchema 等可能还没随渲染落到新值，
+  // 立刻写库会把刚恢复的现场又覆盖成空。
+  const savedOnceRef = useRef(false);
+  useEffect(() => {
+    if (!sessionReady) return;
+    if (!savedOnceRef.current) {
+      // 等一帧，让恢复出来的状态先完成首次渲染
+      savedOnceRef.current = true;
+      return;
+    }
+    const t = setTimeout(() => {
+      const sess: AppSession = {
+        src: {
+          id: src.id,
+          host: src.host,
+          port: src.port,
+          username: src.username,
+          passwordSaved: !!src.passwordSaved,
+          schema: srcSchema,
+        },
+        dst: {
+          id: dst.id,
+          host: dst.host,
+          port: dst.port,
+          username: dst.username,
+          passwordSaved: !!dst.passwordSaved,
+          schema: dstSchema,
+        },
+        selectedTables: [...selected],
+        overrides: overrides as Record<string, unknown>,
+      };
+      api.saveSession(sess).catch(() => {});
+    }, 800);
+    return () => clearTimeout(t);
+  }, [sessionReady, src, dst, srcSchema, dstSchema, selected, overrides]);
+
+  // ---- 数据源操作 ----
+  async function refreshSaved() {
+    try {
+      setSavedConns(await api.listConnections());
+    } catch {
+      /* 忽略 */
+    }
+  }
+
+  function pickSaved(side: "src" | "dst", c: SavedConnection) {
+    const apply = (prev: ConnectionDraft): ConnectionDraft => ({
+      ...prev,
+      id: c.id,
+      label: c.name,
+      host: c.host,
+      port: c.port,
+      username: c.username,
+      use_tls: c.use_tls,
+      // 密码在钥匙串里，留空表示沿用
+      password: "",
+      passwordSaved: true,
+      connection_id: c.id,
+    });
+    if (side === "src") {
+      setSrc(apply);
+      if (c.last_src_schema) setSrcSchema(c.last_src_schema);
+    } else {
+      setDst(apply);
+      if (c.last_dst_schema) setDstSchema(c.last_dst_schema);
+    }
+  }
+
+  async function deleteSaved(id: string) {
+    await api.removeConnection(id);
+    await refreshSaved();
+  }
 
   // ---- 选择 ----
   const toggleTable = (name: string) =>
@@ -297,6 +428,9 @@ export default function App() {
               onSelectAll={(names) => setSelected(new Set(names))}
               totalRows={totalRows}
               disabled={run.running}
+              saved={savedConns}
+              onPickSaved={(c) => pickSaved("src", c)}
+              onDeleteSaved={deleteSaved}
             />
 
             <div className="relative flex min-w-[560px] flex-1 flex-col">
@@ -345,6 +479,9 @@ export default function App() {
               disabled={run.running}
               willCreate={report?.tables.filter((t) => t.needs_create_table).length ?? 0}
               existing={report?.tables.filter((t) => t.target_rows_exists).length ?? 0}
+              saved={savedConns}
+              onPickSaved={(c) => pickSaved("dst", c)}
+              onDeleteSaved={deleteSaved}
             />
           </div>
 

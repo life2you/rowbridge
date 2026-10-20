@@ -9,6 +9,8 @@ import type {
   TableDetail,
   TableRow,
   TaskReport,
+  SavedConnection,
+  AppSession,
   TaskSummary,
   TestResult,
 } from "./types";
@@ -51,6 +53,24 @@ export const api = {
 
   hasPassword: (connectionId: string) =>
     invoke<boolean>("has_password", { connectionId }),
+
+  listConnections: () => invoke<SavedConnection[]>("list_connections"),
+
+  saveConnection: (conn: SavedConnection) =>
+    invoke<void>("save_connection", { conn }),
+
+  removeConnection: (connectionId: string) =>
+    invoke<void>("remove_connection", { connectionId }),
+
+  touchConnection: (connectionId: string) =>
+    invoke<void>("touch_connection", { connectionId }),
+
+  getSession: () => invoke<AppSession | null>("get_session"),
+
+  saveSession: (session: AppSession) =>
+    invoke<void>("save_session", { session }),
+
+  clearSession: () => invoke<void>("clear_session"),
 
   listTasks: () => invoke<TaskSummary[]>("list_tasks"),
 

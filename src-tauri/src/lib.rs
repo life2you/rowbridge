@@ -36,6 +36,13 @@ pub fn run() {
             commands::has_password,
             commands::list_tasks,
             commands::task_logs,
+            commands::list_connections,
+            commands::save_connection,
+            commands::remove_connection,
+            commands::touch_connection,
+            commands::get_session,
+            commands::save_session,
+            commands::clear_session,
         ])
         .run(tauri::generate_context!())
         .expect("RowBridge 启动失败");
