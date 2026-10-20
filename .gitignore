@@ -13,3 +13,7 @@ dist-ssr
 
 # Tauri
 src-tauri/gen/schemas
+
+# 仅 macOS 桌面端，移动端图标不需要
+src-tauri/icons/android
+src-tauri/icons/ios
