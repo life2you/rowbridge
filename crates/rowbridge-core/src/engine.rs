@@ -539,8 +539,11 @@ async fn sync_one(
     }
 
     let use_new_upsert = !dst_is_mariadb && dst_ver >= (8, 0, 19);
-    // 占位符上限：行数 × 列数 ≤ 65535
+    // 占位符上限：行数 × 列数 ≤ 65535。
+    // 必须约束初始批大小——否则宽表第一批就会报 1390
+    // (Prepared statement contains too many placeholders)。
     let placeholder_cap = (MAX_PLACEHOLDERS / run.columns.len().max(1)).max(1);
+    run.batch_size = run.batch_size.min(placeholder_cap);
 
     loop {
         if cancel.is_cancelled() {

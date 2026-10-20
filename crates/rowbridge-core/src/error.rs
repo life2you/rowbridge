@@ -58,7 +58,8 @@ impl Error {
 
     /// 是否应该缩减批大小后重试。
     pub fn should_shrink_batch(&self) -> bool {
-        matches!(self, Error::MySql { code: 1153 | 2006, .. })
+        // 1153 = 包过大；2006 = 连接断开；1390 = 占位符过多（宽表）
+        matches!(self, Error::MySql { code: 1153 | 2006 | 1390, .. })
     }
 
     pub fn code(&self) -> Option<u16> {
@@ -83,6 +84,29 @@ impl From<mysql_async::Error> for Error {
             },
             other => Error::Other(other.to_string()),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn err(code: u16) -> Error {
+        Error::MySql {
+            code,
+            state: "HY000".into(),
+            message: "test".into(),
+        }
+    }
+
+    #[test]
+    fn error_1390_shrinks_batch() {
+        // 1390 = 预处理语句占位符过多（宽表），应触发批大小减半
+        assert!(err(1390).should_shrink_batch());
+        assert!(err(1153).should_shrink_batch()); // 包过大
+        assert!(err(2006).should_shrink_batch()); // 连接断开
+        assert!(!err(1049).should_shrink_batch()); // 库不存在，不该缩批
+        assert!(!err(1205).should_shrink_batch()); // 锁等待，重试即可
     }
 }
 

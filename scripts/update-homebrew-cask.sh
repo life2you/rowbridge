@@ -113,7 +113,8 @@ cask "rowbridge" do
   desc "MySQL data sync tool that copies tables by primary-key batches"
   homepage "$HOMEPAGE"
 
-  depends_on macos: :catalina
+  # 新版 Homebrew 禁用了 depends_on macos:，最低系统版本由 Info.plist 的
+  # LSMinimumSystemVersion 保证，这里不要再加。
   depends_on arch: :arm64
 
   app "RowBridge.app"
