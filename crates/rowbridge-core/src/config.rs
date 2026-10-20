@@ -227,7 +227,7 @@ pub struct TaskOptions {
 fn default_parallelism() -> usize {
     2
 }
-fn default_batch_size() -> usize {
+pub fn default_batch_size() -> usize {
     1000
 }
 fn default_max_batch_size() -> usize {
@@ -264,6 +264,13 @@ impl Default for TaskOptions {
     }
 }
 
+
+    #[test]
+    fn batch_size_default_is_1000() {
+        // 引擎靠这个值判断「用户有没有动过批大小」，
+        // 改了默认值这里必须同步更新。
+        assert_eq!(default_batch_size(), 1000);
+    }
 #[cfg(test)]
 mod tests {
     use super::*;

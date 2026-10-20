@@ -397,6 +397,17 @@ export default function App() {
                     end_id: g.end_id,
                   })
                 }
+                batchSize={options.batch_size}
+                maxBatchSize={options.max_batch_size}
+                adaptiveBatch={options.adaptive_batch}
+                onBatchChange={(batch, maxBatch, adaptive) =>
+                  setOptions({
+                    ...options,
+                    batch_size: batch,
+                    max_batch_size: maxBatch,
+                    adaptive_batch: adaptive,
+                  })
+                }
                 onRemove={toggleTable}
                 onPreflight={doPreflight}
                 onStart={doStart}

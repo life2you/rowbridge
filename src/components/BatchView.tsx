@@ -20,6 +20,10 @@ export function BatchView({
   onChange,
   global,
   onGlobalChange,
+  batchSize,
+  maxBatchSize,
+  adaptiveBatch,
+  onBatchChange,
   onRemove,
   onPreflight,
   onStart,
@@ -34,6 +38,12 @@ export function BatchView({
   onChange: (table: string, ov: TableCursor) => void;
   global: GlobalCursor;
   onGlobalChange: (g: GlobalCursor) => void;
+  /** 初始批大小（自适应开启时以此为起点） */
+  batchSize: number;
+  /** 一批最多多少行。宽表会自动压到 65535/列数，可能低于这个值 */
+  maxBatchSize: number;
+  adaptiveBatch: boolean;
+  onBatchChange: (batchSize: number, maxBatchSize: number, adaptive: boolean) => void;
   onRemove: (table: string) => void;
   onPreflight: () => void;
   onStart: () => void;
@@ -125,8 +135,9 @@ export function BatchView({
         </div>
       </div>
 
-      {/* 批量工具条 */}
-      <div className="flex shrink-0 flex-wrap items-center gap-1.5 border-b border-[var(--color-border)] bg-[#14171d] px-3 py-1.5 text-[11px]">
+      {/* 批量工具条：第一行批量游标，第二行批大小等执行参数 */}
+      <div className="shrink-0 space-y-1 border-b border-[var(--color-border)] bg-[#14171d] px-3 py-1.5 text-[11px]">
+      <div className="flex flex-wrap items-center gap-1.5">
         <span className="text-[var(--color-muted)]">批量设置</span>
         <select
           value={batchMode}
@@ -164,7 +175,7 @@ export function BatchView({
           清除
         </button>
         <span className="ml-auto text-[10.5px] text-[#5c6478]">
-          全局默认：
+          全局默认游标：
           <select
             value={global.cursor_start}
             onChange={(e) =>
@@ -180,6 +191,61 @@ export function BatchView({
             <option value="custom">自定义</option>
           </select>
         </span>
+      </div>
+
+      {/* 第二行：执行参数 */}
+      <div className="flex flex-wrap items-center gap-1.5 border-t border-[#1e222b] pt-1">
+        <span className="text-[10.5px] text-[var(--color-muted)]">执行参数</span>
+        <span className="flex items-center gap-1 text-[10.5px] text-[#5c6478]">
+          <span>批大小</span>
+          <input
+            type="number"
+            min={1}
+            value={batchSize}
+            disabled={running}
+            onChange={(e) =>
+              onBatchChange(Number(e.target.value) || 1, maxBatchSize, adaptiveBatch)
+            }
+            data-testid="batch-size"
+            className="w-[58px] !py-0.5 !text-[11px]"
+            title="每批读取的起始行数（自适应开启时从此值开始爬升）"
+          />
+          <span>最多</span>
+          <input
+            type="number"
+            min={1}
+            value={maxBatchSize}
+            disabled={running}
+            onChange={(e) =>
+              onBatchChange(batchSize, Number(e.target.value) || 1, adaptiveBatch)
+            }
+            data-testid="max-batch-size"
+            className="w-[58px] !py-0.5 !text-[11px]"
+            title="一批最多多少行；宽表会自动压到 65535/列数"
+          />
+          <span className="text-[#5c6478]">行/批</span>
+        </span>
+        <label
+          className="flex cursor-pointer items-center gap-1 text-[10.5px] text-[#5c6478]"
+          title="开启后按每批耗时自动调整；关闭则始终用「批大小」"
+        >
+          <input
+            type="checkbox"
+            checked={adaptiveBatch}
+            disabled={running}
+            onChange={(e) =>
+              onBatchChange(batchSize, maxBatchSize, e.target.checked)
+            }
+            className="h-3 w-3 accent-[var(--color-accent)]"
+          />
+          自适应
+        </label>
+        <span className="text-[9.5px] text-[#4a5265]">
+          {adaptiveBatch
+            ? "按耗时自动爬升，不会超过「最多」"
+            : "固定用「批大小」，不自动调整"}
+        </span>
+      </div>
       </div>
 
       {/* 表格 */}

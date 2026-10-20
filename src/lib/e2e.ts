@@ -424,7 +424,54 @@ async function scenarioDataSource(): Promise<void> {
   (window as unknown as { __E2E_RESULTS__: typeof results }).__E2E_RESULTS__ = results;
 }
 
+/** 批大小控件：出现在工具条、可编辑、影响请求参数。 */
+async function scenarioBatchCtl(): Promise<void> {
+  overlay();
+
+  await fillConnection("src", "127.0.0.1", "3307", "root", "root123");
+  await fillConnection("dst", "127.0.0.1", "3308", "root", "root123");
+  await waitUntil(
+    () => document.body.innerText.includes("8.0"),
+    "连接就绪",
+    20000,
+  );
+
+  setSelect(await waitFor<HTMLSelectElement>('[data-testid="src-schema"]'), "db_a");
+  await waitFor('[data-testid="table-simple"]', 20000);
+  await sleep(300);
+
+  const dstSelect = await waitFor<HTMLSelectElement>('[data-testid="dst-schema"]');
+  await waitUntil(
+    () => Array.from(dstSelect.options).some((o) => o.value === "db_b"),
+    "目标库出现",
+    20000,
+  );
+  setSelect(dstSelect, "db_b");
+
+  const cb = await waitFor<HTMLInputElement>('[data-testid="table-simple"]');
+  if (!cb.checked) cb.click();
+  await sleep(600);
+
+  // 工具条应出现批大小控件
+  const bs = await waitFor<HTMLInputElement>('[data-testid="batch-size"]');
+  const mbs = await waitFor<HTMLInputElement>('[data-testid="max-batch-size"]');
+  report("工具条有批大小控件", !!bs && !!mbs);
+
+  // 修改并验证回显
+  setInput(bs, "500");
+  setInput(mbs, "3000");
+  await sleep(300);
+  report(
+    "批大小可修改",
+    (bs as HTMLInputElement).value === "500" && (mbs as HTMLInputElement).value === "3000",
+  );
+
+  window.dispatchEvent(new CustomEvent("e2e-done", { detail: results }));
+  (window as unknown as { __E2E_RESULTS__: typeof results }).__E2E_RESULTS__ = results;
+}
+
 const scenarios: Record<string, Step[]> = {
+  batchctl: [{ name: "batchctl", run: scenarioBatchCtl }],
   datasource: [{ name: "datasource", run: scenarioDataSource }],
   persist: [{ name: "persist", run: scenarioPersist }],
   full: [{ name: "full", run: scenarioFull }],

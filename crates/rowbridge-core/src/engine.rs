@@ -449,15 +449,27 @@ async fn sync_one(
 
     // 按往返延迟挑初始批大小。远程库 RTT 高，从 1000 起步再慢慢放大，
     // 光爬升阶段就要浪费几十次往返；直接按延迟给个合理起点。
+    //
+    // 注意：这里绝不能 max() 覆盖用户设的值——用户明确填了批大小（比如
+    // 关闭自适应想要固定 137 行/批），就必须原样生效。只有用户没设
+    // （等于默认值）时才用 RTT 推荐值，否则用户填多少就是多少。
     let initial_batch = {
         let t0 = Instant::now();
         let _ = src.query_drop("SELECT 1").await;
         let rtt_ms = t0.elapsed().as_secs_f64() * 1000.0;
-        match rtt_ms {
-            r if r < 2.0 => opts.batch_size.max(2000),
-            r if r < 10.0 => opts.batch_size.max(2000),
-            r if r < 30.0 => opts.batch_size.max(5000),
-            _ => opts.batch_size.max(10000),
+        let default_sized = opts.batch_size == crate::config::default_batch_size();
+        let recommended = match rtt_ms {
+            r if r < 2.0 => 2000usize,
+            r if r < 10.0 => 2000usize,
+            r if r < 30.0 => 5000usize,
+            _ => 10000usize,
+        };
+        if default_sized {
+            // 用户没动过批大小：用 RTT 推荐值，避免远程库爬升太慢
+            opts.batch_size.max(recommended)
+        } else {
+            // 用户设过：完全尊重，不放大不缩小
+            opts.batch_size
         }
     };
 
