@@ -167,6 +167,17 @@ npm run tauri build
 # 产物在 src-tauri/target/release/bundle/dmg/
 ```
 
+### 原生 GPUI 界面（实验）
+
+除了 Tauri + React 界面，仓库里还有一份用 Rust + GPUI（gpui-kit）写的原生界面，不含 WebView：
+
+```bash
+cargo run -p rowbridge-gpui --release
+```
+
+它复用同一个引擎和同一份 `~/.RowBridge/connections.json`，与 Tauri 版可并存。
+详见 [docs/GPUI.md](docs/GPUI.md)。
+
 ### 引擎可以脱离 UI 单独跑
 
 引擎在 `crates/rowbridge-core`，不依赖 Tauri。UI 只是它的外壳。

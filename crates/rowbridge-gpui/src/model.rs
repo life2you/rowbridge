@@ -1,0 +1,354 @@
+//! UI 数据模型：连接面板、选项面板、表行、运行进度。
+
+use gpui_kit::component::input::InputState;
+use gpui_kit::*;
+use rowbridge_core::config::{ConnConfig, CursorStart};
+use rowbridge_core::connections::SavedConnection;
+
+/// 哪一侧的数据库（源 / 目标）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DbSide {
+    Src,
+    Dst,
+}
+
+impl DbSide {
+    pub fn title(self) -> &'static str {
+        match self {
+            DbSide::Src => "源数据库",
+            DbSide::Dst => "目标数据库",
+        }
+    }
+}
+
+/// 全局游标模式。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CursorMode {
+    Full,
+    Resume,
+    Custom,
+}
+
+impl CursorMode {
+    pub fn label(self) -> &'static str {
+        match self {
+            CursorMode::Full => "全量",
+            CursorMode::Resume => "续跑",
+            CursorMode::Custom => "自定义",
+        }
+    }
+    pub fn to_core(self) -> CursorStart {
+        match self {
+            CursorMode::Full => CursorStart::Full,
+            CursorMode::Resume => CursorStart::Resume,
+            CursorMode::Custom => CursorStart::Custom,
+        }
+    }
+}
+
+/// 三态开关：跟随全局 / 开 / 关。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Tri {
+    Follow,
+    On,
+    Off,
+}
+
+impl Tri {
+    pub fn label(self) -> &'static str {
+        match self {
+            Tri::Follow => "跟随",
+            Tri::On => "是",
+            Tri::Off => "否",
+        }
+    }
+    pub fn next(self) -> Tri {
+        match self {
+            Tri::Follow => Tri::On,
+            Tri::On => Tri::Off,
+            Tri::Off => Tri::Follow,
+        }
+    }
+    pub fn to_option(self) -> Option<bool> {
+        match self {
+            Tri::Follow => None,
+            Tri::On => Some(true),
+            Tri::Off => Some(false),
+        }
+    }
+    pub fn from_option(v: Option<bool>) -> Tri {
+        match v {
+            None => Tri::Follow,
+            Some(true) => Tri::On,
+            Some(false) => Tri::Off,
+        }
+    }
+}
+
+/// 一个数据库连接的表单面板。
+pub struct ConnPanel {
+    pub host: Entity<InputState>,
+    pub port: Entity<InputState>,
+    pub user: Entity<InputState>,
+    pub password: Entity<InputState>,
+    pub use_tls: bool,
+    /// 关联的已保存数据源 id
+    pub saved_id: Option<String>,
+    /// 已保存数据源的显示名
+    pub label: Option<SharedString>,
+    /// (是否成功, 文案)
+    pub note: Option<(bool, SharedString)>,
+    pub busy: bool,
+}
+
+impl ConnPanel {
+    pub fn new(
+        title_placeholder: &'static str,
+        window: &mut Window,
+        cx: &mut App,
+    ) -> Self {
+        let host = cx.new(|cx| {
+            InputState::new(window, cx)
+                .placeholder("主机，例如 127.0.0.1")
+                .default_value("127.0.0.1")
+        });
+        let port = cx.new(|cx| {
+            InputState::new(window, cx)
+                .placeholder("端口")
+                .default_value("3306")
+        });
+        let user = cx.new(|cx| {
+            InputState::new(window, cx)
+                .placeholder(title_placeholder)
+                .default_value("root")
+        });
+        let password = cx.new(|cx| InputState::new(window, cx).placeholder("密码").masked(true));
+        Self {
+            host,
+            port,
+            user,
+            password,
+            use_tls: false,
+            saved_id: None,
+            label: None,
+            note: None,
+            busy: false,
+        }
+    }
+
+    pub fn inputs(&self) -> Vec<Entity<InputState>> {
+        vec![
+            self.host.clone(),
+            self.port.clone(),
+            self.user.clone(),
+            self.password.clone(),
+        ]
+    }
+
+    pub fn host_text(&self, cx: &App) -> String {
+        self.host.read(cx).value().to_string()
+    }
+    pub fn port_text(&self, cx: &App) -> String {
+        self.port.read(cx).value().to_string()
+    }
+    pub fn user_text(&self, cx: &App) -> String {
+        self.user.read(cx).value().to_string()
+    }
+    pub fn password_text(&self, cx: &App) -> String {
+        self.password.read(cx).value().to_string()
+    }
+
+    pub fn conn_config(&self, cx: &App) -> ConnConfig {
+        ConnConfig {
+            host: self.host_text(cx).trim().to_string(),
+            port: self.port_text(cx).trim().parse().unwrap_or(3306),
+            username: self.user_text(cx).trim().to_string(),
+            password: self.password_text(cx),
+            schema: None,
+            use_tls: self.use_tls,
+        }
+    }
+
+    pub fn apply_saved(&mut self, c: &SavedConnection, window: &mut Window, cx: &mut App) {
+        self.saved_id = Some(c.id.clone());
+        self.label = Some(c.name.clone().into());
+        self.use_tls = c.use_tls;
+        set_input(&self.host, c.host.clone(), window, cx);
+        set_input(&self.port, c.port.to_string(), window, cx);
+        set_input(&self.user, c.username.clone(), window, cx);
+        set_input(&self.password, c.password.clone(), window, cx);
+    }
+
+    pub fn display_name(&self, cx: &App) -> SharedString {
+        match &self.label {
+            Some(l) => l.clone(),
+            None => format!(
+                "{}@{}:{}",
+                self.user_text(cx),
+                self.host_text(cx),
+                self.port_text(cx)
+            )
+            .into(),
+        }
+    }
+}
+
+/// 把文本写进输入框（不触发 Change 事件）。
+pub fn set_input(
+    state: &Entity<InputState>,
+    value: impl Into<SharedString>,
+    window: &mut Window,
+    cx: &mut App,
+) {
+    let value = value.into();
+    state.update(cx, |state, cx| state.set_value(value, window, cx));
+}
+
+/// 批量参数与高级选项。
+pub struct OptionsPanel {
+    pub parallelism: Entity<InputState>,
+    pub batch_size: Entity<InputState>,
+    pub max_batch_size: Entity<InputState>,
+    pub global_start: Entity<InputState>,
+    pub global_end: Entity<InputState>,
+    pub cursor: CursorMode,
+    pub adaptive_batch: bool,
+    pub create_table: bool,
+    pub create_database: bool,
+    pub strip_foreign_keys: bool,
+    pub strip_auto_increment: bool,
+    pub map_collation: bool,
+    pub disable_foreign_key_checks: bool,
+    pub truncate_target: bool,
+    pub relax_sql_mode: bool,
+    pub continue_on_error: bool,
+}
+
+impl OptionsPanel {
+    pub fn new(window: &mut Window, cx: &mut impl AppContext) -> Self {
+        let parallelism = cx.new(|cx| InputState::new(window, cx).placeholder("并发").default_value("2"));
+        let batch_size = cx.new(|cx| InputState::new(window, cx).placeholder("批大小").default_value("1000"));
+        let max_batch_size =
+            cx.new(|cx| InputState::new(window, cx).placeholder("批大小上限").default_value("10000"));
+        let global_start = cx.new(|cx| InputState::new(window, cx).placeholder("起始 ID"));
+        let global_end = cx.new(|cx| InputState::new(window, cx).placeholder("结束 ID"));
+        Self {
+            parallelism,
+            batch_size,
+            max_batch_size,
+            global_start,
+            global_end,
+            cursor: CursorMode::Full,
+            adaptive_batch: true,
+            create_table: true,
+            create_database: true,
+            strip_foreign_keys: true,
+            strip_auto_increment: true,
+            map_collation: true,
+            disable_foreign_key_checks: false,
+            truncate_target: false,
+            relax_sql_mode: false,
+            continue_on_error: true,
+        }
+    }
+
+    pub fn inputs(&self) -> Vec<Entity<InputState>> {
+        vec![
+            self.parallelism.clone(),
+            self.batch_size.clone(),
+            self.max_batch_size.clone(),
+            self.global_start.clone(),
+            self.global_end.clone(),
+        ]
+    }
+
+    pub fn usize_of(&self, state: &Entity<InputState>, cx: &App, default: usize) -> usize {
+        let raw = state.read(cx).value().to_string();
+        raw.trim().parse().unwrap_or(default)
+    }
+
+    pub fn text_of(&self, state: &Entity<InputState>, cx: &App) -> Option<String> {
+        let raw = state.read(cx).value().to_string();
+        let trimmed = raw.trim();
+        if trimmed.is_empty() {
+            None
+        } else {
+            Some(trimmed.to_string())
+        }
+    }
+}
+
+/// 单表的游标 / 目标表覆盖。
+#[derive(Debug, Clone, Default)]
+pub struct TableOverride {
+    pub dst_table: Option<String>,
+    pub cursor: Option<CursorStart>,
+    pub start_id: Option<String>,
+    pub end_id: Option<String>,
+    pub truncate: Option<bool>,
+}
+
+/// 表清单里的一行。
+#[derive(Debug, Clone)]
+pub struct TableRow {
+    pub name: String,
+    pub rows_estimate: u64,
+    pub primary_key: Option<String>,
+    pub unsupported: Option<String>,
+    pub selected: bool,
+    pub over: TableOverride,
+}
+
+/// 引擎事件的 UI 视图。
+#[derive(Debug, Clone)]
+pub struct TableProgress {
+    pub status: &'static str,
+    pub rows: u64,
+    pub planned: u64,
+    pub rps: f64,
+    pub cursor: String,
+    pub error: Option<String>,
+}
+
+impl TableProgress {
+    pub fn pending(planned: u64) -> Self {
+        Self {
+            status: "pending",
+            rows: 0,
+            planned,
+            rps: 0.0,
+            cursor: String::new(),
+            error: None,
+        }
+    }
+    pub fn percent(&self) -> f32 {
+        if self.planned == 0 {
+            if self.status == "done" {
+                100.0
+            } else {
+                0.0
+            }
+        } else {
+            (self.rows as f32 * 100.0 / self.planned as f32).clamp(0.0, 100.0)
+        }
+    }
+}
+
+/// 主视图。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Tab {
+    Sync,
+    Sources,
+    Log,
+}
+
+/// 人类可读的行数。
+pub fn human_rows(n: u64) -> String {
+    if n >= 100_000_000 {
+        format!("{:.2} 亿", n as f64 / 1e8)
+    } else if n >= 10_000 {
+        format!("{:.1} 万", n as f64 / 1e4)
+    } else {
+        format!("{n}")
+    }
+}

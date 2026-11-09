@@ -1,5 +1,5 @@
 [workspace]
-members = ["crates/rowbridge-core", "src-tauri"]
+members = ["crates/rowbridge-core", "crates/rowbridge-gpui", "src-tauri"]
 resolver = "2"
 
 [workspace.package]
