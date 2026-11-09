@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useMemo, useState } from "react";
 import type { SavedConnection, SchemaInfo, TableRow, ValidatedTable } from "../lib/types";
 import type { ConnectionDraft } from "./ConnectionEditor";
 import { cn, formatInt } from "../lib/format";
@@ -52,15 +52,37 @@ export function TablePane({
   validating: Set<string>;
 }) {
   const [filter, setFilter] = useState("");
+  const [filterTab, setFilterTab] = useState<"all" | "syncable" | "selected">("all");
+  const [sortBy, setSortBy] = useState<"name" | "rows">("name");
 
   const isSrc = side === "src";
   const dot = isSrc ? "var(--color-accent)" : "var(--color-ok)";
 
-  const visible = tables.filter((t) =>
-    filter.trim() ? t.name.toLowerCase().includes(filter.trim().toLowerCase()) : true,
+  const allSyncable = useMemo(
+    () => tables.filter((t) => !t.unsupported_reason && !t.is_view),
+    [tables],
   );
-  const syncable = visible.filter((t) => !t.unsupported_reason && !t.is_view);
-  const allOn = syncable.length > 0 && syncable.every((t) => selected.has(t.name));
+
+  const visible = useMemo(() => {
+    let list = tables.filter((t) =>
+      filter.trim() ? t.name.toLowerCase().includes(filter.trim().toLowerCase()) : true,
+    );
+    if (filterTab === "syncable") {
+      list = list.filter((t) => !t.unsupported_reason && !t.is_view);
+    } else if (filterTab === "selected") {
+      list = list.filter((t) => selected.has(t.name));
+    }
+    const cloned = [...list];
+    if (sortBy === "rows") {
+      cloned.sort((a, b) => (b.rows_estimate || 0) - (a.rows_estimate || 0));
+    } else {
+      cloned.sort((a, b) => a.name.localeCompare(b.name));
+    }
+    return cloned;
+  }, [tables, filter, filterTab, sortBy, selected]);
+
+  const currentSyncable = visible.filter((t) => !t.unsupported_reason && !t.is_view);
+  const allOn = currentSyncable.length > 0 && currentSyncable.every((t) => selected.has(t.name));
 
   return (
     <div
@@ -133,25 +155,93 @@ export function TablePane({
       {isSrc ? (
         <>
           <div className="shrink-0 px-3 pt-2">
-            <input
-              value={filter}
-              onChange={(e) => setFilter(e.target.value)}
-              placeholder="搜索表名…"
-              className="w-full !py-1 !text-[12px]"
-              spellCheck={false}
-            />
+            <div className="relative flex items-center">
+              <input
+                value={filter}
+                onChange={(e) => setFilter(e.target.value)}
+                placeholder="搜索表名…"
+                className="w-full !py-1 !pr-6 !text-[12px]"
+                spellCheck={false}
+              />
+              {filter && (
+                <button
+                  type="button"
+                  onClick={() => setFilter("")}
+                  className="absolute right-2 text-[11px] text-[var(--color-muted)] hover:text-[var(--color-text)]"
+                >
+                  ✕
+                </button>
+              )}
+            </div>
           </div>
+
+          {/* 状态胶囊筛选与排序 */}
+          <div className="flex items-center justify-between px-3 pt-1.5 text-[10.5px]">
+            <div className="flex items-center gap-1">
+              <button
+                type="button"
+                onClick={() => setFilterTab("all")}
+                className={cn(
+                  "px-1.5 py-0.5 rounded transition-colors",
+                  filterTab === "all"
+                    ? "bg-[#252c3b] text-[var(--color-text)] font-medium"
+                    : "text-[var(--color-muted)] hover:text-[var(--color-text)]",
+                )}
+              >
+                全部 {tables.length}
+              </button>
+              <button
+                type="button"
+                onClick={() => setFilterTab("syncable")}
+                className={cn(
+                  "px-1.5 py-0.5 rounded transition-colors",
+                  filterTab === "syncable"
+                    ? "bg-[#252c3b] text-[var(--color-ok)] font-medium"
+                    : "text-[var(--color-muted)] hover:text-[var(--color-ok)]",
+                )}
+              >
+                可同步 {allSyncable.length}
+              </button>
+              <button
+                type="button"
+                onClick={() => setFilterTab("selected")}
+                className={cn(
+                  "px-1.5 py-0.5 rounded transition-colors",
+                  filterTab === "selected"
+                    ? "bg-[#252c3b] text-[var(--color-accent)] font-medium"
+                    : "text-[var(--color-muted)] hover:text-[var(--color-accent)]",
+                )}
+              >
+                已选 {selected.size}
+              </button>
+            </div>
+            <button
+              type="button"
+              onClick={() => setSortBy(sortBy === "name" ? "rows" : "name")}
+              className="text-[#6c778c] hover:text-[var(--color-text)] text-[10px]"
+              title="切换按名称或行数排序"
+            >
+              {sortBy === "name" ? "按名" : "按行"}
+            </button>
+          </div>
+
           <div className="flex shrink-0 items-center justify-between px-3 py-1.5">
             <button
               type="button"
-              disabled={disabled || syncable.length === 0}
-              onClick={() => onSelectAll(allOn ? [] : syncable.map((t) => t.name))}
+              disabled={disabled || currentSyncable.length === 0}
+              onClick={() =>
+                onSelectAll(
+                  allOn
+                    ? []
+                    : Array.from(new Set([...selected, ...currentSyncable.map((t) => t.name)]))
+                )
+              }
               className="text-[11px] text-[var(--color-accent)] hover:underline disabled:opacity-40"
             >
-              {allOn ? "取消全选" : `全选可同步 (${syncable.length})`}
+              {allOn ? "取消当前选中" : `勾选本视图 (${currentSyncable.length})`}
             </button>
             <span className="text-[11px] text-[var(--color-muted)]">
-              已选 <b className="text-[var(--color-text)]">{selected.size}</b>
+              当前展示 <b className="text-[var(--color-text)]">{visible.length}</b>
             </span>
           </div>
 

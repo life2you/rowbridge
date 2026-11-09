@@ -12,6 +12,7 @@
 //! - [`value`]    值的无损搬运
 
 pub mod config;
+pub mod connections;
 pub mod ddl;
 pub mod engine;
 pub mod error;

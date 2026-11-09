@@ -33,6 +33,7 @@ pub fn run() {
             commands::validate_tables,
             commands::describe_table,
             commands::preflight,
+            commands::sync_schema,
             commands::start_sync,
             commands::cancel_sync,
             commands::list_tasks,

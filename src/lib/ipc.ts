@@ -5,6 +5,7 @@ import type {
   PreflightReport,
   RunRequest,
   SchemaInfo,
+  SchemaSyncReport,
   SyncEvent,
   TableDetail,
   TableRow,
@@ -34,6 +35,9 @@ export const api = {
 
   preflight: (req: RunRequest) =>
     invoke<PreflightReport>("preflight", { req }),
+
+  syncSchema: (req: RunRequest, report: PreflightReport) =>
+    invoke<SchemaSyncReport>("sync_schema", { req, report }),
 
   /** 返回值在任务结束时才 resolve；过程中通过 onEvent 推送进度。 */
   startSync: (req: RunRequest, taskId: string, report: PreflightReport, onEvent: (e: SyncEvent) => void) => {

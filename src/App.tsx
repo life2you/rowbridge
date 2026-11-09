@@ -39,6 +39,7 @@ const defaultOptions: OptionsForm = {
   strip_auto_increment: true,
   map_collation: true,
   disable_foreign_key_checks: false,
+  truncate_target: false,
   relax_sql_mode: false,
   continue_on_error: true,
 };
@@ -73,6 +74,8 @@ export default function App() {
   const [report, setReport] = useState<PreflightReport | null>(null);
   const [preflighting, setPreflighting] = useState(false);
   const [preflightError, setPreflightError] = useState<string | null>(null);
+  const [syncingSchema, setSyncingSchema] = useState(false);
+  const [schemaSuccessMsg, setSchemaSuccessMsg] = useState<string | null>(null);
 
   const [savedConns, setSavedConns] = useState<SavedConnection[]>([]);
   // 已通过 validate_tables 校验的表：表名 -> 校验结果
@@ -272,22 +275,75 @@ export default function App() {
       const ov = overrides[t.name] ?? {};
       return {
         table: t.name,
-        dst_table: null,
+        dst_table: ov.dst_table?.trim() ? ov.dst_table.trim() : null,
         cursor_start: ov.cursor_start ?? null,
         start_id: ov.start_id ?? null,
         end_id: ov.end_id ?? null,
+        truncate_target: ov.truncate_target ?? null,
       };
     }),
     options,
   });
 
   // ---- 动作 ----
+  async function doSyncSchema() {
+    if (!report) return;
+    setSyncingSchema(true);
+    setPreflightError(null);
+    try {
+      const res = await api.syncSchema(buildRequest(), report);
+      const totalCreated = res.tables_created.length;
+      const totalAltered = res.columns_added.length;
+      const totalDbs = res.databases_created.length;
+      let msg = `表结构同步成功 (${res.elapsed_ms}ms)！`;
+      if (totalDbs > 0) msg += ` 创建库 ${totalDbs} 个；`;
+      if (totalCreated > 0) msg += ` 新建表 ${totalCreated} 张；`;
+      if (totalAltered > 0) msg += ` 补齐列 ${totalAltered} 处；`;
+      if (res.errors.length > 0) msg += ` (有 ${res.errors.length} 项跳过)`;
+      setSchemaSuccessMsg(msg);
+      setTimeout(() => setSchemaSuccessMsg(null), 6000);
+
+      // 结构同步完成后，重新触发预检以刷新各表对齐状态
+      const updatedReport = await api.preflight(buildRequest());
+      setReport(updatedReport);
+      setTables((prev) =>
+        prev.map((tab) => {
+          const pt = updatedReport.tables.find((t) => t.table === tab.name);
+          if (pt?.source_max_pk) {
+            const num = Number(pt.source_max_pk);
+            if (Number.isFinite(num)) {
+              return { ...tab, max_pk: num };
+            }
+          }
+          return tab;
+        })
+      );
+    } catch (e) {
+      setPreflightError(`表结构同步失败: ${errorMessage(e)}`);
+      setDrawerOpen(true);
+    } finally {
+      setSyncingSchema(false);
+    }
+  }
+
   async function doPreflight() {
     setPreflighting(true);
     setPreflightError(null);
     try {
       const r = await api.preflight(buildRequest());
       setReport(r);
+      setTables((prev) =>
+        prev.map((tab) => {
+          const pt = r.tables.find((t) => t.table === tab.name);
+          if (pt?.source_max_pk) {
+            const num = Number(pt.source_max_pk);
+            if (Number.isFinite(num)) {
+              return { ...tab, max_pk: num };
+            }
+          }
+          return tab;
+        })
+      );
       setDrawerOpen(true);
     } catch (e) {
       setPreflightError(errorMessage(e));
@@ -340,6 +396,86 @@ export default function App() {
     if (taskId) await api.cancelSync(taskId);
   }
 
+  async function doResumeIncomplete() {
+    if (!report) return;
+    const incomplete = report.tables.filter((t) => {
+      const p = run.progress.get(t.table);
+      return !p || p.status !== "done";
+    });
+    if (incomplete.length === 0) return;
+
+    const names = incomplete.map((t) => t.table);
+    setSelected(new Set(names));
+    const nextOverrides = { ...overrides };
+    for (const name of names) {
+      nextOverrides[name] = {
+        ...nextOverrides[name],
+        cursor_start: "resume",
+      };
+    }
+    setOverrides(nextOverrides);
+
+    setPreflighting(true);
+    setPreflightError(null);
+    try {
+      const req: RunRequest = {
+        source: srcConn,
+        target: dstConn,
+        src_schema: srcSchema!,
+        dst_schema: dstSchema!,
+        tables: names.map((name) => {
+          const ov = nextOverrides[name] ?? {};
+          return {
+            table: name,
+            dst_table: ov.dst_table?.trim() ? ov.dst_table.trim() : null,
+            cursor_start: "resume",
+            start_id: ov.start_id ?? null,
+            end_id: ov.end_id ?? null,
+          };
+        }),
+        options,
+      };
+      const r = await api.preflight(req);
+      setReport(r);
+      setTables((prev) =>
+        prev.map((tab) => {
+          const pt = r.tables.find((t) => t.table === tab.name);
+          if (pt?.source_max_pk) {
+            const num = Number(pt.source_max_pk);
+            if (Number.isFinite(num)) {
+              return { ...tab, max_pk: num };
+            }
+          }
+          return tab;
+        })
+      );
+      setDrawerOpen(true);
+    } catch (e) {
+      setPreflightError(errorMessage(e));
+      setReport(null);
+      setDrawerOpen(true);
+    } finally {
+      setPreflighting(false);
+    }
+  }
+
+  // 快捷键支持：Cmd/Ctrl + Enter 触发预检或启动
+  useEffect(() => {
+    const handleKeyDown = (e: KeyboardEvent) => {
+      if ((e.metaKey || e.ctrlKey) && e.key === "Enter") {
+        if (canStart) {
+          e.preventDefault();
+          doStart();
+        } else if (canPreflight) {
+          e.preventDefault();
+          doPreflight();
+        }
+      }
+    };
+    window.addEventListener("keydown", handleKeyDown);
+    return () => window.removeEventListener("keydown", handleKeyDown);
+  }, [canStart, canPreflight, report, selectedList, options, overrides]);
+
   return (
     <div className="flex h-full flex-col">
       {/* 顶栏 */}
@@ -359,6 +495,12 @@ export default function App() {
               <Badge tone="ok">预检通过 {runnableCount}</Badge>
             )}
           </>
+        )}
+
+        {schemaSuccessMsg && (
+          <span className="text-[11px] text-[var(--color-ok)] font-medium bg-[#14281a] px-2 py-0.5 rounded border border-[#234d2d]">
+            ✓ {schemaSuccessMsg}
+          </span>
         )}
 
         <div className="ml-auto flex items-center gap-2">
@@ -455,6 +597,8 @@ export default function App() {
                 batchSize={options.batch_size}
                 maxBatchSize={options.max_batch_size}
                 adaptiveBatch={options.adaptive_batch}
+                options={options}
+                onOptionsChange={setOptions}
                 onBatchChange={(batch, maxBatch, adaptive) =>
                   setOptions({
                     ...options,
@@ -471,6 +615,9 @@ export default function App() {
                 canStart={canStart}
                 running={run.running}
                 hasReport={!!report}
+                report={report}
+                onSyncSchema={doSyncSchema}
+                syncingSchema={syncingSchema}
               />
             </div>
 
@@ -506,6 +653,9 @@ export default function App() {
             startError={startError}
             onCancel={doCancel}
             onPreflight={doPreflight}
+            onResume={doResumeIncomplete}
+            onSyncSchema={doSyncSchema}
+            syncingSchema={syncingSchema}
             canPreflight={canPreflight}
           />
         </>

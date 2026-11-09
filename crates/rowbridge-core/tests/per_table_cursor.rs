@@ -51,6 +51,7 @@ fn task_in(
         cursor_start: cs,
         start_id: start.map(str::to_string),
         end_id: end.map(str::to_string),
+        truncate_target: None,
     }
 }
 

@@ -223,35 +223,52 @@ fn strip_auto_increment_option(ddl: &str) -> Option<String> {
 }
 
 /// 移除所有 `CONSTRAINT `x` FOREIGN KEY (...) REFERENCES ...`，返回被移除的约束名。
+/// 支持单行和跨行外键约束定义。
 fn strip_foreign_keys(ddl: &str) -> (String, Vec<String>) {
     let mut removed = Vec::new();
     let mut out_lines: Vec<String> = Vec::new();
 
     let had_trailing_newline = ddl.ends_with('\n');
     let lines: Vec<&str> = ddl.lines().collect();
-    let last_idx = lines.len().saturating_sub(1);
 
-    for (idx, line) in lines.iter().enumerate() {
+    let mut in_fk = false;
+
+    for line in lines {
         let trimmed = line.trim_start();
         let lower = trimmed.to_ascii_lowercase();
-        let is_fk = lower.starts_with("constraint")
-            && lower.contains("foreign key")
-            || (lower.starts_with("foreign key") && lower.contains("references"));
-        if is_fk {
+
+        if in_fk {
+            // 如果遇到表定义的结束括号，停止外键跳过
+            if trimmed.starts_with(')') {
+                in_fk = false;
+                out_lines.push(line.to_string());
+                continue;
+            }
+            // 当前行仍是多行外键的一部分，跳过；如果以逗号结尾，说明该外键定义结束
+            if trimmed.trim_end().ends_with(',') {
+                in_fk = false;
+            }
+            continue;
+        }
+
+        let is_fk_start = (lower.starts_with("constraint") && (lower.contains("foreign key") || lower.contains("references")))
+            || (lower.starts_with("foreign key") && (lower.contains("references") || lower.contains('(')));
+
+        if is_fk_start {
             if let Some(name) = extract_constraint_name(trimmed) {
                 removed.push(name);
             } else {
                 removed.push("(未命名外键)".into());
             }
-            // 这一行被删了；如果它是最后一条（原本以逗号结尾），要给上一条去掉逗号。
+
+            // 如果这一行未以逗号结尾，说明外键定义延续到下一行
+            if !trimmed.trim_end().ends_with(',') {
+                in_fk = true;
+            }
             continue;
         }
-        out_lines.push((*line).to_string());
 
-        // 如果删掉的正好是最后一行且原行以逗号结尾，需要修正上一条。
-        if idx == last_idx {
-            // 最后一行不是外键，正常
-        }
+        out_lines.push(line.to_string());
     }
 
     // 若最后一条有效数据行以逗号结尾但后面已无内容，去掉该逗号。
@@ -394,6 +411,16 @@ mod tests {
             .changes
             .iter()
             .any(|c| c.kind == "foreign_keys" && c.detail.contains("fk_p")));
+    }
+
+    #[test]
+    fn strips_multiline_foreign_key() {
+        let ddl = "CREATE TABLE `orders` (\n  `id` int NOT NULL,\n  `user_id` int NOT NULL,\n  PRIMARY KEY (`id`),\n  CONSTRAINT `fk_user` FOREIGN KEY (`user_id`)\n    REFERENCES `users` (`id`)\n    ON DELETE CASCADE\n) ENGINE=InnoDB";
+        let r = rewrite_create_table(ddl, &opts());
+        assert!(!r.ddl.contains("FOREIGN KEY"), "{}", r.ddl);
+        assert!(!r.ddl.contains("REFERENCES"), "{}", r.ddl);
+        assert!(!r.ddl.contains("ON DELETE CASCADE"), "{}", r.ddl);
+        assert!(r.ddl.contains("PRIMARY KEY (`id`)\n)"), "{}", r.ddl);
     }
 
     #[test]

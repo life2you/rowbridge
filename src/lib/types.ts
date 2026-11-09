@@ -34,7 +34,9 @@ export interface TablePreflight {
   source_max_pk: string | null;
   target_max_pk: string | null;
   source_rows_estimate: number;
+  planned_rows?: number;
   target_rows_exists: boolean;
+  alter_sqls?: string[];
   cursor_start: CursorMode;
   start_id: string | null;
   end_id: string | null;
@@ -46,6 +48,14 @@ export interface PreflightReport {
   target_version: string;
   same_instance: boolean;
   checks: Check[];
+}
+
+export interface SchemaSyncReport {
+  databases_created: string[];
+  tables_created: string[];
+  columns_added: string[];
+  errors: string[];
+  elapsed_ms: number;
 }
 
 export interface SchemaInfo {
@@ -137,6 +147,7 @@ export interface OptionsForm {
   strip_auto_increment: boolean;
   map_collation: boolean;
   disable_foreign_key_checks: boolean;
+  truncate_target?: boolean;
   relax_sql_mode: boolean;
   continue_on_error: boolean;
 }
@@ -150,6 +161,7 @@ export interface TableSpec {
   cursor_start?: CursorMode | null;
   start_id?: string | null;
   end_id?: string | null;
+  truncate_target?: boolean | null;
 }
 
 /** 每张表的游标覆写（空字符串表示「不限」） */
@@ -157,6 +169,7 @@ export interface CursorOverride {
   cursor_start?: CursorMode | null;
   start_id?: string | null;
   end_id?: string | null;
+  truncate_target?: boolean | null;
 }
 
 export interface RunRequest {

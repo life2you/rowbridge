@@ -100,17 +100,30 @@ export function reduceRun(
     }
     case "batch_done": {
       const p = next.progress.get(ev.table);
+      const prevRps = p?.rowsPerSec ?? 0;
+      // 指数加权移动平均 EMA (平滑因子 0.35)，避免单批网络波动造成速率剧烈抖动
+      const smoothedRps =
+        prevRps > 0
+          ? Math.round((prevRps * 0.65 + ev.rows_per_sec * 0.35) * 10) / 10
+          : ev.rows_per_sec;
+
       next.progress.set(ev.table, {
         table: ev.table,
         rows: ev.total_rows,
         cursor: ev.cursor,
-        rowsPerSec: ev.rows_per_sec,
+        rowsPerSec: smoothedRps,
         batchSize: ev.batch_size,
         status: p?.status === "created" ? "created" : "running",
         error: null,
         elapsedMs: ev.elapsed_ms,
       });
-      next.totalRows = ev.total_rows;
+
+      // 累加所有表的实时进度，避免多表并行时总行数被单表进度覆盖
+      let sumRows = 0;
+      for (const prog of next.progress.values()) {
+        sumRows += prog.rows;
+      }
+      next.totalRows = sumRows;
       break;
     }
     case "table_done": {
@@ -125,6 +138,11 @@ export function reduceRun(
         error: null,
         elapsedMs: ev.elapsed_ms,
       });
+      let sumRows = 0;
+      for (const prog of next.progress.values()) {
+        sumRows += prog.rows;
+      }
+      next.totalRows = sumRows;
       next.logs = [
         ...state.logs,
         {

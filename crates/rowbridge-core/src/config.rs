@@ -123,6 +123,9 @@ pub struct TableTaskConfig {
     /// 本表独立的结束 id（含）
     #[serde(default)]
     pub end_id: Option<String>,
+    /// 本表是否在同步前清空目标表；None 表示跟随全局 TaskOptions
+    #[serde(default)]
+    pub truncate_target: Option<bool>,
 }
 
 impl TableTaskConfig {
@@ -144,6 +147,11 @@ impl TableTaskConfig {
     /// 解析本表实际生效的结束 id。
     pub fn effective_end_id(&self, global: &TaskOptions) -> Option<String> {
         self.end_id.clone().or_else(|| global.end_id.clone())
+    }
+
+    /// 解析本表实际生效的 truncate 策略：表级优先，其次全局。
+    pub fn effective_truncate_target(&self, global: &TaskOptions) -> bool {
+        self.truncate_target.unwrap_or(global.truncate_target)
     }
 
     /// 是否有表级游标覆盖。
@@ -213,6 +221,9 @@ pub struct TaskOptions {
     /// 会话级 foreign_key_checks=0
     #[serde(default)]
     pub disable_foreign_key_checks: bool,
+    /// 同步数据前清空目标表 (TRUNCATE TABLE)
+    #[serde(default)]
+    pub truncate_target: bool,
     /// 会话级 sql_mode=''
     #[serde(default)]
     pub relax_sql_mode: bool,
@@ -257,6 +268,7 @@ impl Default for TaskOptions {
             strip_auto_increment: true,
             map_collation: true,
             disable_foreign_key_checks: false,
+            truncate_target: false,
             relax_sql_mode: false,
             continue_on_error: true,
             max_retries: default_retries(),
@@ -315,7 +327,28 @@ mod tests {
             cursor_start: cs,
             start_id: start.map(|s| s.to_string()),
             end_id: end.map(|s| s.to_string()),
+            truncate_target: None,
         }
+    }
+
+    #[test]
+    fn table_truncate_overrides_global() {
+        let global_false = TaskOptions {
+            truncate_target: false,
+            ..Default::default()
+        };
+        let mut t = task("a", None, None, None);
+        assert!(!t.effective_truncate_target(&global_false));
+
+        t.truncate_target = Some(true);
+        assert!(t.effective_truncate_target(&global_false));
+
+        let global_true = TaskOptions {
+            truncate_target: true,
+            ..Default::default()
+        };
+        t.truncate_target = Some(false);
+        assert!(!t.effective_truncate_target(&global_true));
     }
 
     #[test]

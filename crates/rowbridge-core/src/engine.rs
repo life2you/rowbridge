@@ -69,6 +69,15 @@ pub struct TableStats {
     pub error: Option<String>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct SchemaSyncReport {
+    pub databases_created: Vec<String>,
+    pub tables_created: Vec<String>,
+    pub columns_added: Vec<String>,
+    pub errors: Vec<String>,
+    pub elapsed_ms: u64,
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct TaskReport {
     pub tables: Vec<TableStats>,
@@ -108,6 +117,8 @@ struct TableRun {
     pk_index: usize,
     columns: Vec<String>,
     cursor: Cursor,
+    /// 是否包含当前游标值（第一批自定义起始 ID 为 true，即闭区间 `>=`；后续批次为 false，即 `>`）
+    cursor_inclusive: bool,
     end_id: Option<i128>,
     /// 结束主键的原始 Value，用于下推到 SQL 的 `pk <= ?`
     end_pk: Option<Value>,
@@ -116,6 +127,82 @@ struct TableRun {
     dst_schema: String,
     src_table: String,
     dst_table: String,
+}
+
+/// 仅同步表结构（包括自动建库、创建缺失表、为已有表追加缺失列）。
+/// 纯 DDL 操作，不读写任何数据行。
+pub async fn sync_schema(
+    cfg: &TaskConfig,
+    preflight: &preflight::PreflightReport,
+) -> Result<SchemaSyncReport> {
+    let started = Instant::now();
+    let mut out = SchemaSyncReport::default();
+
+    let mut dst = connect(&cfg.target, "目标").await?;
+    let mut src = connect(&cfg.source, "源").await?;
+
+    let mut created_dbs = std::collections::HashSet::new();
+
+    for pf in &preflight.tables {
+        // 1. 如果需要建库
+        if !created_dbs.contains(&pf.target_schema) {
+            let db_exists = introspect::schema_exists(&mut dst, &pf.target_schema).await?;
+            if !db_exists && cfg.options.create_database {
+                let (charset, collation) = source_schema_charset(&mut src, &pf.source_schema)
+                    .await
+                    .unwrap_or(("utf8mb4".to_string(), "utf8mb4_general_ci".to_string()));
+                let sql = format!(
+                    "CREATE DATABASE IF NOT EXISTS {} DEFAULT CHARACTER SET {charset} COLLATE {collation}",
+                    crate::value::quote_ident(&pf.target_schema)
+                );
+                dst.query_drop(&sql).await.map_err(|e| {
+                    Error::Other(format!("创建目标库 {} 失败: {e}", pf.target_schema))
+                })?;
+                out.databases_created.push(pf.target_schema.clone());
+            }
+            created_dbs.insert(pf.target_schema.clone());
+        }
+
+        // 2. 如果需要建表
+        if pf.needs_create_table {
+            if let Some(ct) = &pf.create_table {
+                match dst.query_drop(&ct.ddl).await {
+                    Ok(()) => {
+                        out.tables_created.push(format!("{}.{}", pf.target_schema, pf.target_table));
+                    }
+                    Err(e) => {
+                        let err_msg = format!("创建表 {}.{} 失败: {e}", pf.target_schema, pf.target_table);
+                        out.errors.push(err_msg.clone());
+                        if !cfg.options.continue_on_error {
+                            return Err(Error::Other(err_msg));
+                        }
+                    }
+                }
+            }
+        }
+
+        // 3. 如果已有表缺少列（结构变更）
+        for alter_sql in &pf.alter_sqls {
+            match dst.query_drop(alter_sql).await {
+                Ok(()) => {
+                    out.columns_added.push(alter_sql.clone());
+                }
+                Err(e) => {
+                    let err_msg = format!("执行结构变更失败 ({alter_sql}): {e}");
+                    out.errors.push(err_msg.clone());
+                    if !cfg.options.continue_on_error {
+                        return Err(Error::Other(err_msg));
+                    }
+                }
+            }
+        }
+    }
+
+    let _ = src.disconnect().await;
+    let _ = dst.disconnect().await;
+
+    out.elapsed_ms = started.elapsed().as_millis() as u64;
+    Ok(out)
 }
 
 /// 执行整个同步任务（多表并行）。
@@ -145,25 +232,43 @@ pub async fn run_task(
 
     // 建库/建表串行执行，避免并发 DDL 冲突。
     let mut dst = connect(&cfg.target, "目标").await?;
+    let mut src = connect(&cfg.source, "源").await?;
     let mut ready: Vec<TablePreflight> = Vec::new();
+    let mut report = TaskReport::default();
+
     for pf in runnable {
         if cancel.is_cancelled() {
             break;
         }
-        match prepare_table(&mut dst, &pf, &opts, &sink).await {
+        let should_truncate = cfg
+            .tables
+            .iter()
+            .find(|t| t.table == pf.table)
+            .map(|t| t.effective_truncate_target(&opts))
+            .unwrap_or(opts.truncate_target);
+        match prepare_table(&mut src, &mut dst, &pf, &opts, should_truncate, &sink).await {
             Ok(()) => ready.push(pf),
             Err(e) => {
                 sink.emit(Event::TableFailed {
                     table: pf.table.clone(),
                     error: e.to_string(),
                 });
+                report.failed += 1;
+                report.tables.push(TableStats {
+                    table: pf.table.clone(),
+                    status: "failed".into(),
+                    error: Some(e.to_string()),
+                    ..Default::default()
+                });
                 if !opts.continue_on_error {
+                    drop(src);
                     drop(dst);
                     return Err(e);
                 }
             }
         }
     }
+    drop(src);
     drop(dst);
 
     let sem = Arc::new(tokio::sync::Semaphore::new(parallelism));
@@ -194,6 +299,7 @@ pub async fn run_task(
                 cursor_start: None,
                 start_id: None,
                 end_id: None,
+                truncate_target: None,
             });
 
         futs.push(tokio::spawn(async move {
@@ -202,7 +308,6 @@ pub async fn run_task(
         }));
     }
 
-    let mut report = TaskReport::default();
     let mut cancelled_mid = false;
 
     while let Some(joined) = futs.next().await {
@@ -262,9 +367,11 @@ async fn connect(cfg: &ConnConfig, label: &str) -> Result<Conn> {
 
 /// 建库 + 建表。
 async fn prepare_table(
+    src: &mut Conn,
     dst: &mut Conn,
     pf: &TablePreflight,
     opts: &TaskOptions,
+    should_truncate: bool,
     sink: &EventSink,
 ) -> Result<()> {
     if pf.has_blocking_error() {
@@ -285,8 +392,8 @@ async fn prepare_table(
                 pf.target_schema
             )));
         }
-        // 沿用源库的字符集，避免建出来的库用错默认 charset。
-        let (charset, collation) = source_schema_charset(dst, &pf.source_schema)
+        // 沿用源库的字符集，从源库连接查询，避免跨实例时因目标端无同名库而查错。
+        let (charset, collation) = source_schema_charset(src, &pf.source_schema)
             .await
             .unwrap_or(("utf8mb4".to_string(), "utf8mb4_general_ci".to_string()));
         let sql = format!(
@@ -304,6 +411,30 @@ async fn prepare_table(
     }
 
     if introspect::table_exists(dst, &pf.target_schema, &pf.target_table).await? {
+        if should_truncate {
+            if opts.disable_foreign_key_checks {
+                let _ = dst.query_drop("SET FOREIGN_KEY_CHECKS = 0").await;
+            }
+            let trunc_sql = format!(
+                "TRUNCATE TABLE {}.{}",
+                quote_ident(&pf.target_schema),
+                quote_ident(&pf.target_table)
+            );
+            dst.query_drop(&trunc_sql).await.map_err(|e| {
+                Error::Other(format!(
+                    "清空目标表 {}.{} 失败: {e}",
+                    pf.target_schema, pf.target_table
+                ))
+            })?;
+            sink.emit(Event::Log {
+                table: Some(pf.table.clone()),
+                level: "info".into(),
+                message: format!(
+                    "已清空目标表 {}.{} (TRUNCATE TABLE)",
+                    pf.target_schema, pf.target_table
+                ),
+            });
+        }
         return Ok(());
     }
 
@@ -482,15 +613,18 @@ async fn sync_one(
         .effective_end_id(opts)
         .filter(|s| !s.trim().is_empty());
 
-    let cursor = match eff_cursor_start {
-        CursorStart::Full => Cursor::start(),
+    let (cursor, cursor_inclusive) = match eff_cursor_start {
+        CursorStart::Full => (Cursor::start(), false),
         CursorStart::Resume => {
             let max = read_max_pk(&mut dst, &pf.target_schema, &pf.target_table, &pk).await?;
-            Cursor::from_max_pk(max)
+            (Cursor::from_max_pk(max), false)
         }
         CursorStart::Custom => match &eff_start_id {
-            Some(s) => Cursor(Some(parse_cursor_value(s, pf.primary_key_unsigned)?)),
-            _ => Cursor::start(),
+            Some(s) => (
+                Cursor(Some(parse_cursor_value(s, pf.primary_key_unsigned)?)),
+                true, // 自定义起始ID包含此行（闭区间 [start_id, end_id]）
+            ),
+            _ => (Cursor::start(), false),
         },
     };
 
@@ -533,6 +667,7 @@ async fn sync_one(
         pk_index,
         columns: pf.columns.clone(),
         cursor,
+        cursor_inclusive,
         end_id,
         end_pk,
         batch_size: initial_batch.clamp(MIN_BATCH, opts.max_batch_size.max(MIN_BATCH)),
@@ -543,10 +678,11 @@ async fn sync_one(
     };
 
     if !run.cursor.is_start() {
+        let op = if run.cursor_inclusive { ">=" } else { ">" };
         sink.emit(Event::Log {
             table: Some(pf.table.clone()),
             level: "info".into(),
-            message: format!("起始游标 {} > {}", run.pk, run.cursor.display()),
+            message: format!("起始游标 {} {op} {}", run.pk, run.cursor.display()),
         });
     }
 
@@ -557,6 +693,8 @@ async fn sync_one(
     let placeholder_cap = (MAX_PLACEHOLDERS / run.columns.len().max(1)).max(1);
     run.batch_size = run.batch_size.min(placeholder_cap);
 
+    let mut sql_cache: Option<(usize, String)> = None;
+
     loop {
         if cancel.is_cancelled() {
             break;
@@ -566,7 +704,14 @@ async fn sync_one(
         // 记录本批实际使用的批大小。自适应会改动 run.batch_size，
         // 若用改动后的值判断「是否已读完」，批大小翻倍时会误判提前结束而静默丢行。
         let fetch_size = run.batch_size;
-        let (rows, wire_bytes) = fetch_batch(&mut src, &run).await?;
+        let (rows, wire_bytes) = fetch_batch_retry(
+            &mut src,
+            src_cfg,
+            opts,
+            &run,
+            sink,
+            &pf.table,
+        ).await?;
         if rows.is_empty() {
             break;
         }
@@ -600,7 +745,17 @@ async fn sync_one(
             continue;
         }
 
-        let write_result = write_batch(&mut dst, &run, &rows, opts, use_new_upsert).await;
+        let write_result = write_batch_retry(
+            &mut dst,
+            dst_cfg,
+            opts,
+            &run,
+            &rows,
+            use_new_upsert,
+            sink,
+            &pf.table,
+            &mut sql_cache,
+        ).await;
 
         match write_result {
             Ok(()) => {}
@@ -619,6 +774,7 @@ async fn sync_one(
         }
 
         run.cursor.advance(last_pk);
+        run.cursor_inclusive = false;
         stats.rows += returned as u64;
         stats.batches += 1;
         stats.cursor = run.cursor.display();
@@ -700,6 +856,83 @@ fn is_last_batch(returned: usize, fetch_size: usize) -> bool {
     returned < fetch_size
 }
 
+/// 读取一批数据，带重试与自动重连。
+async fn fetch_batch_retry(
+    src: &mut Conn,
+    src_cfg: &ConnConfig,
+    opts: &TaskOptions,
+    run: &TableRun,
+    sink: &EventSink,
+    table: &str,
+) -> Result<(Vec<Vec<Value>>, u64)> {
+    let mut attempt = 0;
+    loop {
+        match fetch_batch(src, run).await {
+            Ok(res) => return Ok(res),
+            Err(e) if attempt < opts.max_retries && e.is_retryable() => {
+                attempt += 1;
+                sink.emit(Event::Warning {
+                    table: Some(table.to_string()),
+                    message: format!(
+                        "源端读取异常 ({e})，正在第 {attempt}/{} 次重试...",
+                        opts.max_retries
+                    ),
+                });
+                if matches!(e.code(), Some(2006 | 2013)) || matches!(e, Error::Io(_)) {
+                    if let Ok(mut new_conn) = connect(src_cfg, "源").await {
+                        let _ = apply_session_opts(&mut new_conn, opts, false).await;
+                        *src = new_conn;
+                    }
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(200 * attempt as u64)).await;
+            }
+            Err(e) => return Err(e),
+        }
+    }
+}
+
+/// 写入一批数据，带重试、自动重连与缩批支持。
+async fn write_batch_retry(
+    dst: &mut Conn,
+    dst_cfg: &ConnConfig,
+    opts: &TaskOptions,
+    run: &TableRun,
+    rows: &[Vec<Value>],
+    use_new_upsert: bool,
+    sink: &EventSink,
+    table: &str,
+    sql_cache: &mut Option<(usize, String)>,
+) -> Result<()> {
+    let mut attempt = 0;
+    loop {
+        match write_batch(dst, run, rows, opts, use_new_upsert, sql_cache).await {
+            Ok(()) => return Ok(()),
+            Err(e) if e.should_shrink_batch() => {
+                // 由上层缩批逻辑处理
+                return Err(e);
+            }
+            Err(e) if attempt < opts.max_retries && e.is_retryable() => {
+                attempt += 1;
+                sink.emit(Event::Warning {
+                    table: Some(table.to_string()),
+                    message: format!(
+                        "目标端写入异常 ({e})，正在第 {attempt}/{} 次重试...",
+                        opts.max_retries
+                    ),
+                });
+                if matches!(e.code(), Some(2006 | 2013)) || matches!(e, Error::Io(_)) {
+                    if let Ok(mut new_conn) = connect(dst_cfg, "目标").await {
+                        let _ = apply_session_opts(&mut new_conn, opts, true).await;
+                        *dst = new_conn;
+                    }
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(300 * attempt as u64)).await;
+            }
+            Err(e) => return Err(e),
+        }
+    }
+}
+
 /// 读取一批数据。返回 (行, 估算线上字节数)。
 async fn fetch_batch(src: &mut Conn, run: &TableRun) -> Result<(Vec<Vec<Value>>, u64)> {
     let cols = run
@@ -716,7 +949,8 @@ async fn fetch_batch(src: &mut Conn, run: &TableRun) -> Result<(Vec<Vec<Value>>,
     let mut params: Vec<Value> = Vec::new();
 
     if let Some(v) = &run.cursor.0 {
-        conds.push(format!("{} > ?", quote_ident(&run.pk)));
+        let op = if run.cursor_inclusive { ">=" } else { ">" };
+        conds.push(format!("{} {op} ?", quote_ident(&run.pk)));
         params.push(v.clone());
     }
     if let Some(end) = &run.end_pk {
@@ -755,18 +989,12 @@ async fn fetch_batch(src: &mut Conn, run: &TableRun) -> Result<(Vec<Vec<Value>>,
     Ok((rows, bytes))
 }
 
-/// 写入一批。一个事务，一条多行 INSERT。
-async fn write_batch(
-    dst: &mut Conn,
+fn build_write_sql(
     run: &TableRun,
-    rows: &[Vec<Value>],
+    row_count: usize,
     opts: &TaskOptions,
     use_new_upsert: bool,
-) -> Result<()> {
-    if rows.is_empty() {
-        return Ok(());
-    }
-
+) -> String {
     let ncols = run.columns.len();
     let cols = run
         .columns
@@ -778,19 +1006,12 @@ async fn write_batch(
         "({})",
         std::iter::repeat("?").take(ncols).collect::<Vec<_>>().join(",")
     );
-
-    let mut params: Vec<Value> = Vec::with_capacity(rows.len() * ncols);
-    for r in rows {
-        debug_assert_eq!(r.len(), ncols, "列数不一致");
-        params.extend(r.iter().cloned());
-    }
-
     let values_clause = std::iter::repeat(row_placeholder.as_str())
-        .take(rows.len())
+        .take(row_count)
         .collect::<Vec<_>>()
         .join(",");
 
-    let sql = match opts.write_mode {
+    match opts.write_mode {
         WriteMode::Insert => format!(
             "INSERT INTO {} ({cols}) VALUES {values_clause}",
             qualified(&run.dst_schema, &run.dst_table)
@@ -829,6 +1050,41 @@ async fn write_batch(
                 qualified(&run.dst_schema, &run.dst_table)
             )
         }
+    }
+}
+
+/// 写入一批。一个事务，一条多行 INSERT。
+async fn write_batch(
+    dst: &mut Conn,
+    run: &TableRun,
+    rows: &[Vec<Value>],
+    opts: &TaskOptions,
+    use_new_upsert: bool,
+    sql_cache: &mut Option<(usize, String)>,
+) -> Result<()> {
+    if rows.is_empty() {
+        return Ok(());
+    }
+
+    let ncols = run.columns.len();
+    let mut params: Vec<Value> = Vec::with_capacity(rows.len() * ncols);
+    for r in rows {
+        debug_assert_eq!(r.len(), ncols, "列数不一致");
+        params.extend(r.iter().cloned());
+    }
+
+    let sql = if let Some((cached_len, cached_sql)) = sql_cache {
+        if *cached_len == rows.len() {
+            cached_sql.clone()
+        } else {
+            let new_sql = build_write_sql(run, rows.len(), opts, use_new_upsert);
+            *sql_cache = Some((rows.len(), new_sql.clone()));
+            new_sql
+        }
+    } else {
+        let new_sql = build_write_sql(run, rows.len(), opts, use_new_upsert);
+        *sql_cache = Some((rows.len(), new_sql.clone()));
+        new_sql
     };
 
     // 一条语句完成「开事务 + 写入 + 提交」，把每批 3 次往返压成 1 次。

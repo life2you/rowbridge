@@ -67,7 +67,12 @@ pub struct TablePreflight {
     pub source_max_pk: Option<String>,
     pub target_max_pk: Option<String>,
     pub source_rows_estimate: u64,
+    /// 本次同步预计处理的行数（综合考量自定义游标区间、断点续传已有最大主键与源表行数估算）
+    pub planned_rows: u64,
     pub target_rows_exists: bool,
+    /// 目标表缺失列时生成的 ALTER TABLE 语句列表（用于先同步结构）
+    #[serde(default)]
+    pub alter_sqls: Vec<String>,
     /// 本表生效的游标模式（表级优先，其次全局）
     pub cursor_start: crate::config::CursorStart,
     /// 本表生效的起始 id
@@ -101,6 +106,11 @@ impl PreflightReport {
 
     pub fn syncable_tables(&self) -> Vec<&TablePreflight> {
         self.tables.iter().filter(|t| t.syncable).collect()
+    }
+
+    /// 是否存在需要同步的表结构（包含缺失表新建或已有表补全列）
+    pub fn has_schema_changes(&self) -> bool {
+        self.tables.iter().any(|t| t.needs_create_table || !t.alter_sqls.is_empty())
     }
 }
 
@@ -301,9 +311,19 @@ async fn check_table(
 
     // ---- 与目标表已有结构的差异 ----
     let mut target_max_pk = None;
+    let mut alter_sqls = Vec::new();
     if target_rows_exists {
         let dst_detail = introspect::table_detail(dst, &task.dst_schema, &dst_table_name).await?;
-        compare_columns(&src_detail, &dst_detail, &columns, &mut checks);
+        compare_columns(
+            &src_detail,
+            &dst_detail,
+            &columns,
+            &task.dst_schema,
+            &dst_table_name,
+            dst_ver,
+            &mut checks,
+            &mut alter_sqls,
+        );
 
         // 目标端多出的 NOT NULL 无默认值列会导致写入失败
         let missing_required: Vec<String> = dst_detail
@@ -374,6 +394,17 @@ async fn check_table(
     }
 
     let cursor_start = task.effective_cursor_start(options);
+    let will_truncate = task.effective_truncate_target(options);
+    if will_truncate && target_rows_exists {
+        checks.push(Check::warn(
+            "will_truncate_target",
+            format!(
+                "⚠️ 已开启清空目标表：同步前将执行 TRUNCATE TABLE 清空目标表 {}.{} 的已有数据",
+                task.dst_schema, dst_table_name
+            ),
+        ));
+    }
+
     let start_id = task
         .effective_start_id(options)
         .filter(|s| !s.trim().is_empty());
@@ -391,20 +422,20 @@ async fn check_table(
             Some(v) => {
                 if let Ok(maxv) = v.parse::<i128>() {
                     if let Some(src_max) = source_max_pk.as_ref().and_then(|m| m.parse::<i128>().ok()) {
-                        if maxv >= src_max {
+                        if maxv > src_max {
                             checks.push(Check::error(
                                 "cursor_beyond_max",
                                 format!(
-                                    "起始 id {maxv} 已不小于源表 MAX(pk) {src_max}，本表将同步 0 行"
+                                    "起始 id {maxv} 大于源表 MAX(pk) {src_max}，本表将同步 0 行"
                                 ),
                             ));
                         }
                     }
                     if let Some(endv) = end_id.as_ref().and_then(|e| e.parse::<i128>().ok()) {
-                        if endv <= maxv {
+                        if endv < maxv {
                             checks.push(Check::error(
                                 "cursor_empty_range",
-                                format!("结束 id {endv} 不大于起始 id {maxv}，区间为空"),
+                                format!("结束 id {endv} 小于起始 id {maxv}，区间为空"),
                             ));
                         }
                     }
@@ -412,6 +443,15 @@ async fn check_table(
             }
         }
     }
+
+    let planned_rows = estimate_planned_rows(
+        src_rows_estimate,
+        source_max_pk.as_deref(),
+        if will_truncate { None } else { target_max_pk.as_deref() },
+        cursor_start,
+        start_id.as_deref(),
+        end_id.as_deref(),
+    );
 
     Ok(TablePreflight {
         source_schema: task.src_schema.clone(),
@@ -428,11 +468,82 @@ async fn check_table(
         source_max_pk,
         target_max_pk,
         source_rows_estimate: src_rows_estimate,
+        planned_rows,
         target_rows_exists,
+        alter_sqls,
         cursor_start,
         start_id,
         end_id,
     })
+}
+
+/// 估算在特定游标模式下本次任务预期同步的行数。
+pub fn estimate_planned_rows(
+    source_total_estimate: u64,
+    source_max_pk: Option<&str>,
+    target_max_pk: Option<&str>,
+    cursor_start: crate::config::CursorStart,
+    start_id: Option<&str>,
+    end_id: Option<&str>,
+) -> u64 {
+    let src_max = source_max_pk.and_then(|s| s.parse::<i128>().ok());
+    let dst_max = target_max_pk.and_then(|s| s.parse::<i128>().ok());
+    let start_num = start_id.and_then(|s| s.parse::<i128>().ok());
+    let end_num = end_id.and_then(|s| s.parse::<i128>().ok());
+
+    match cursor_start {
+        crate::config::CursorStart::Custom => {
+            let start = start_num.unwrap_or(0);
+            let end = end_num.or(src_max);
+            match end {
+                Some(end_val) => {
+                    if end_val < start {
+                        0
+                    } else {
+                        let span = (end_val - start + 1) as u64;
+                        if source_total_estimate > 0 {
+                            span.min(source_total_estimate)
+                        } else {
+                            span
+                        }
+                    }
+                }
+                None => source_total_estimate,
+            }
+        }
+        crate::config::CursorStart::Resume => {
+            let start = dst_max.unwrap_or(0);
+            let end = end_num.or(src_max);
+            match end {
+                Some(end_val) => {
+                    if end_val <= start {
+                        0
+                    } else {
+                        let span = (end_val - start) as u64;
+                        if source_total_estimate > 0 {
+                            span.min(source_total_estimate)
+                        } else {
+                            span
+                        }
+                    }
+                }
+                None => source_total_estimate,
+            }
+        }
+        crate::config::CursorStart::Full => {
+            if let Some(end_val) = end_num {
+                if end_val <= 0 {
+                    0
+                } else if source_total_estimate > 0 {
+                    (end_val as u64).min(source_total_estimate)
+                } else {
+                    end_val as u64
+                }
+            } else {
+                source_total_estimate
+            }
+        }
+    }
 }
 
 fn check_pk_width(src_col: &crate::introspect::ColumnInfo, checks: &mut Vec<Check>) {
@@ -445,19 +556,111 @@ fn check_pk_width(src_col: &crate::introspect::ColumnInfo, checks: &mut Vec<Chec
     }
 }
 
-fn compare_columns(src: &TableDetail, dst: &TableDetail, used: &[String], checks: &mut Vec<Check>) {
+/// 生成向目标表追加新列的 `ALTER TABLE` 语句。
+pub fn build_add_column_ddl(
+    dst_schema: &str,
+    dst_table: &str,
+    col: &crate::introspect::ColumnInfo,
+    after_col: Option<&str>,
+    target_version: (u16, u16, u16),
+) -> String {
+    let mut sql = format!(
+        "ALTER TABLE {}.{} ADD COLUMN {} {}",
+        crate::value::quote_ident(dst_schema),
+        crate::value::quote_ident(dst_table),
+        crate::value::quote_ident(&col.name),
+        col.column_type
+    );
+
+    let mut collation = col.collation.clone();
+    if target_version.0 > 0 && target_version < (8, 0, 0) {
+        if let Some(c) = &collation {
+            if c.contains("0900") {
+                collation = Some("utf8mb4_general_ci".to_string());
+            }
+        }
+    }
+
+    if let Some(cs) = &col.charset {
+        if !cs.is_empty() && (col.data_type.contains("char") || col.data_type.contains("text")) {
+            sql.push_str(&format!(" CHARACTER SET {cs}"));
+        }
+    }
+    if let Some(coll) = &collation {
+        if !coll.is_empty() && (col.data_type.contains("char") || col.data_type.contains("text")) {
+            sql.push_str(&format!(" COLLATE {coll}"));
+        }
+    }
+
+    if col.is_nullable {
+        sql.push_str(" NULL");
+    } else {
+        sql.push_str(" NOT NULL");
+    }
+
+    if let Some(def) = &col.column_default {
+        let trimmed = def.trim();
+        let upper = trimmed.to_ascii_uppercase();
+        if upper == "NULL" {
+            sql.push_str(" DEFAULT NULL");
+        } else if upper.starts_with("CURRENT_TIMESTAMP") || upper == "NOW()" {
+            sql.push_str(&format!(" DEFAULT {trimmed}"));
+        } else if trimmed.starts_with('\'') || trimmed.parse::<f64>().is_ok() {
+            sql.push_str(&format!(" DEFAULT {trimmed}"));
+        } else {
+            sql.push_str(&format!(" DEFAULT '{}'", trimmed.replace('\'', "''")));
+        }
+    }
+
+    let extra_lower = col.extra.to_ascii_lowercase();
+    if extra_lower.contains("on update current_timestamp") {
+        sql.push_str(" ON UPDATE CURRENT_TIMESTAMP");
+    }
+
+    if let Some(after) = after_col {
+        sql.push_str(&format!(" AFTER {}", crate::value::quote_ident(after)));
+    }
+
+    sql
+}
+
+fn compare_columns(
+    src: &TableDetail,
+    dst: &TableDetail,
+    used: &[String],
+    dst_schema: &str,
+    dst_table: &str,
+    target_version: (u16, u16, u16),
+    checks: &mut Vec<Check>,
+    alter_sqls: &mut Vec<String>,
+) {
     let mut narrowed = Vec::new();
     let mut type_changed = Vec::new();
+    let mut missing_cols = Vec::new();
 
     for name in used {
         let Some(s) = src.columns.iter().find(|c| &c.name == name) else {
             continue;
         };
         let Some(d) = dst.columns.iter().find(|c| &c.name == name) else {
-            checks.push(Check::warn(
-                "column_missing_in_target",
-                format!("目标表缺少列 {name}，该列不会同步"),
+            let src_idx = src.columns.iter().position(|c| &c.name == name).unwrap_or(0);
+            let after_col = if src_idx > 0 {
+                src.columns[..src_idx]
+                    .iter()
+                    .rev()
+                    .find(|c| dst.columns.iter().any(|dc| dc.name == c.name))
+                    .map(|c| c.name.as_str())
+            } else {
+                None
+            };
+            alter_sqls.push(build_add_column_ddl(
+                dst_schema,
+                dst_table,
+                s,
+                after_col,
+                target_version,
             ));
+            missing_cols.push(name.clone());
             continue;
         };
 
@@ -476,6 +679,13 @@ fn compare_columns(src: &TableDetail, dst: &TableDetail, used: &[String], checks
                 narrowed.push(format!("{}: {} → {}", name, s_ty, d_ty));
             }
         }
+    }
+
+    if !missing_cols.is_empty() {
+        checks.push(Check::warn(
+            "column_missing_in_target",
+            format!("目标表缺少列 {:?}，支持先同步表结构自动补全", missing_cols),
+        ));
     }
 
     if !narrowed.is_empty() {
@@ -545,6 +755,80 @@ mod tests {
     use super::*;
 
     #[test]
+    fn estimates_planned_rows_for_custom_range() {
+        // 模拟用户截图场景：总行数 66,381,892，源 MAX 185,828,688，区间 185192703..185741315
+        // 闭区间跨度就是 185741315 - 185192703 + 1 = 548,613 行，实际同步恰为 548,613 行
+        let est = estimate_planned_rows(
+            66_381_892,
+            Some("185828688"),
+            None,
+            crate::config::CursorStart::Custom,
+            Some("185192703"),
+            Some("185741315"),
+        );
+        let span = 185_741_315 - 185_192_703 + 1;
+        assert_eq!(est, span);
+
+        // 没有 MAX(pk) 时，闭区间 [100, 600] 包含 100 和 600，跨度为 501
+        let est_no_max = estimate_planned_rows(
+            65_234_453,
+            None,
+            None,
+            crate::config::CursorStart::Custom,
+            Some("100"),
+            Some("600"),
+        );
+        assert_eq!(est_no_max, 501);
+
+        // 单点闭区间 [500, 500] 包含 1 行
+        let est_single = estimate_planned_rows(
+            1000,
+            None,
+            None,
+            crate::config::CursorStart::Custom,
+            Some("500"),
+            Some("500"),
+        );
+        assert_eq!(est_single, 1);
+
+        // 结束 id < 起始 id 时为 0
+        let est_zero = estimate_planned_rows(
+            1000,
+            None,
+            None,
+            crate::config::CursorStart::Custom,
+            Some("500"),
+            Some("499"),
+        );
+        assert_eq!(est_zero, 0);
+    }
+
+    #[test]
+    fn estimates_planned_rows_for_resume() {
+        // 续传：源 MAX 1000，目标已到 800
+        let est = estimate_planned_rows(
+            1000,
+            Some("1000"),
+            Some("800"),
+            crate::config::CursorStart::Resume,
+            None,
+            None,
+        );
+        assert_eq!(est, 200);
+
+        // 目标已经跟上源端（甚至大于源端），剩余为 0
+        let est_done = estimate_planned_rows(
+            1000,
+            Some("1000"),
+            Some("1000"),
+            crate::config::CursorStart::Resume,
+            None,
+            None,
+        );
+        assert_eq!(est_done, 0);
+    }
+
+    #[test]
     fn splits_types() {
         assert_eq!(split_type("varchar(64)"), ("varchar".into(), Some(64)));
         assert_eq!(split_type("int"), ("int".into(), None));
@@ -583,7 +867,64 @@ mod tests {
             triggers: vec![],
         };
         let mut checks = Vec::new();
-        compare_columns(&src, &dst, &["name".to_string()], &mut checks);
+        let mut alter_sqls = Vec::new();
+        compare_columns(
+            &src,
+            &dst,
+            &["name".to_string()],
+            "d",
+            "t",
+            (8, 0, 36),
+            &mut checks,
+            &mut alter_sqls,
+        );
         assert!(checks.iter().any(|c| c.code == "column_narrowed"));
+    }
+
+    #[test]
+    fn generates_alter_table_for_missing_column() {
+        use crate::introspect::{ColumnInfo, IndexInfo};
+        let mk = |name: &str, ct: &str| ColumnInfo {
+            name: name.into(),
+            data_type: ct.split('(').next().unwrap().into(),
+            column_type: ct.into(),
+            is_nullable: true,
+            column_default: None,
+            extra: String::new(),
+            charset: None,
+            collation: None,
+            is_primary: false,
+        };
+        let src = TableDetail {
+            schema: "s".into(),
+            table: "t".into(),
+            columns: vec![mk("id", "int"), mk("name", "varchar(64)"), mk("age", "int")],
+            indexes: Vec::<IndexInfo>::new(),
+            primary_key: vec!["id".into()],
+            triggers: vec![],
+        };
+        let dst = TableDetail {
+            schema: "d".into(),
+            table: "t".into(),
+            columns: vec![mk("id", "int"), mk("name", "varchar(64)")],
+            indexes: Vec::<IndexInfo>::new(),
+            primary_key: vec!["id".into()],
+            triggers: vec![],
+        };
+        let mut checks = Vec::new();
+        let mut alter_sqls = Vec::new();
+        compare_columns(
+            &src,
+            &dst,
+            &["id".into(), "name".into(), "age".into()],
+            "d",
+            "t",
+            (8, 0, 36),
+            &mut checks,
+            &mut alter_sqls,
+        );
+        assert_eq!(alter_sqls.len(), 1);
+        assert!(alter_sqls[0].contains("ADD COLUMN `age` int"));
+        assert!(alter_sqls[0].contains("AFTER `name`"));
     }
 }

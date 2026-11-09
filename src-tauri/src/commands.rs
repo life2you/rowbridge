@@ -313,6 +313,8 @@ pub struct TableSpec {
     pub start_id: Option<String>,
     #[serde(default)]
     pub end_id: Option<String>,
+    #[serde(default)]
+    pub truncate_target: Option<bool>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -355,6 +357,8 @@ pub struct OptionsForm {
     #[serde(default)]
     pub disable_foreign_key_checks: bool,
     #[serde(default)]
+    pub truncate_target: bool,
+    #[serde(default)]
     pub relax_sql_mode: bool,
     #[serde(default = "d_true")]
     pub continue_on_error: bool,
@@ -389,6 +393,7 @@ impl Default for OptionsForm {
             strip_auto_increment: true,
             map_collation: true,
             disable_foreign_key_checks: false,
+            truncate_target: false,
             relax_sql_mode: false,
             continue_on_error: true,
         }
@@ -418,6 +423,7 @@ fn to_task_config(req: &RunRequest) -> Result<TaskConfig, String> {
         strip_auto_increment: o.strip_auto_increment,
         map_collation: o.map_collation,
         disable_foreign_key_checks: o.disable_foreign_key_checks,
+        truncate_target: o.truncate_target,
         relax_sql_mode: o.relax_sql_mode,
         continue_on_error: o.continue_on_error,
         max_retries: 3,
@@ -439,6 +445,7 @@ fn to_task_config(req: &RunRequest) -> Result<TaskConfig, String> {
             }),
             start_id: t.start_id.clone(),
             end_id: t.end_id.clone(),
+            truncate_target: t.truncate_target,
         })
         .collect();
     Ok(TaskConfig {
@@ -465,6 +472,16 @@ pub async fn preflight(req: RunRequest) -> Result<PreflightReport, String> {
     let _ = sc.disconnect().await;
     let _ = dc.disconnect().await;
     Ok(report)
+}
+
+/// 仅同步表结构：自动创建缺失数据库、创建缺失表、为已有表追加缺失字段。不读写数据。
+#[tauri::command]
+pub async fn sync_schema(
+    req: RunRequest,
+    report: PreflightReport,
+) -> Result<engine::SchemaSyncReport, String> {
+    let cfg = to_task_config(&req)?;
+    engine::sync_schema(&cfg, &report).await.map_err(err)
 }
 
 // ---------------------------------------------------------------- 执行

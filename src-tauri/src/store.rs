@@ -10,6 +10,7 @@ use rusqlite::{params, Connection};
 use serde::Serialize;
 
 static DB_PATH: OnceLock<std::path::PathBuf> = OnceLock::new();
+static DB_CONN: OnceLock<std::sync::Mutex<Connection>> = OnceLock::new();
 
 fn path() -> std::path::PathBuf {
     DB_PATH.get().cloned().unwrap_or_else(|| {
@@ -30,6 +31,8 @@ pub fn init(app: &tauri::AppHandle) -> Result<(), String> {
     conn.execute_batch(
         r#"
         PRAGMA journal_mode = WAL;
+        PRAGMA synchronous = NORMAL;
+        PRAGMA busy_timeout = 5000;
 
         CREATE TABLE IF NOT EXISTS tasks (
             id TEXT PRIMARY KEY,
@@ -54,15 +57,25 @@ pub fn init(app: &tauri::AppHandle) -> Result<(), String> {
             message TEXT NOT NULL
         );
         CREATE INDEX IF NOT EXISTS idx_logs_task ON task_logs(task_id, id);
-
         "#,
     )
     .map_err(|e| format!("初始化表结构失败: {e}"))?;
+
+    let _ = DB_CONN.set(std::sync::Mutex::new(conn));
     Ok(())
 }
 
-fn open() -> Result<Connection, String> {
-    Connection::open(path()).map_err(|e| format!("打开数据库失败: {e}"))
+fn with_conn<F, R>(f: F) -> Result<R, String>
+where
+    F: FnOnce(&mut Connection) -> Result<R, String>,
+{
+    if let Some(mutex) = DB_CONN.get() {
+        let mut guard = mutex.lock().map_err(|e| format!("获取数据库锁失败: {e}"))?;
+        f(&mut *guard)
+    } else {
+        let mut conn = Connection::open(path()).map_err(|e| format!("打开数据库失败: {e}"))?;
+        f(&mut conn)
+    }
 }
 
 fn now_ms() -> i64 {
@@ -80,16 +93,17 @@ pub fn begin_task(
     dst: &str,
 ) -> Result<(), String> {
     let _ = app;
-    let conn = open()?;
-    conn.execute(
-        "INSERT OR REPLACE INTO tasks (id, src, dst, status, started_at) VALUES (?,?,?,?,?)",
-        params![task_id, src, dst, "running", now_ms()],
-    )
-    .map_err(|e| e.to_string())?;
-    Ok(())
+    with_conn(|conn| {
+        conn.execute(
+            "INSERT OR REPLACE INTO tasks (id, src, dst, status, started_at) VALUES (?,?,?,?,?)",
+            params![task_id, src, dst, "running", now_ms()],
+        )
+        .map_err(|e| e.to_string())?;
+        Ok(())
+    })
 }
 
-/// 事件落库。只记有价值的，避免把 10 万条 batch 全写进去。
+/// 事件落库。复用长连接，避免反复 open 导致频繁 I/O 与 SQLite 锁竞争。
 pub fn record_event(app: tauri::AppHandle, task_id: &str, ev: &Event) {
     let row: Option<(&str, Option<String>, String)> = match ev {
         Event::Log {
@@ -115,7 +129,6 @@ pub fn record_event(app: tauri::AppHandle, task_id: &str, ev: &Event) {
             Some(table.clone()),
             format!("完成 {rows} 行，耗时 {elapsed_ms}ms"),
         )),
-        // 每批都记会让日志爆炸，只在结束时汇总
         _ => None,
     };
 
@@ -123,19 +136,21 @@ pub fn record_event(app: tauri::AppHandle, task_id: &str, ev: &Event) {
         return;
     };
     let _ = app;
-    if let Ok(conn) = open() {
-        let _ = conn.execute(
+    let _ = with_conn(|conn| {
+        conn.execute(
             "INSERT INTO task_logs (task_id, ts, level, table_name, message) VALUES (?,?,?,?,?)",
             params![task_id, now_ms(), level, table, message],
-        );
-    }
+        )
+        .map_err(|e| e.to_string())?;
+        Ok(())
+    });
 }
 
 pub fn finish_task(app: tauri::AppHandle, task_id: &str, report: &TaskReport) {
     let _ = app;
-    if let Ok(conn) = open() {
-        let status = if report.cancelled { "cancelled" } else { "done" };
-        let _ = conn.execute(
+    let status = if report.cancelled { "cancelled" } else { "done" };
+    let _ = with_conn(|conn| {
+        conn.execute(
             "UPDATE tasks SET status=?, total_rows=?, succeeded=?, failed=?, elapsed_ms=?, finished_at=? WHERE id=?",
             params![
                 status,
@@ -146,18 +161,22 @@ pub fn finish_task(app: tauri::AppHandle, task_id: &str, report: &TaskReport) {
                 now_ms(),
                 task_id
             ],
-        );
-    }
+        )
+        .map_err(|e| e.to_string())?;
+        Ok(())
+    });
 }
 
 pub fn fail_task(app: tauri::AppHandle, task_id: &str, error: &str) {
     let _ = app;
-    if let Ok(conn) = open() {
-        let _ = conn.execute(
+    let _ = with_conn(|conn| {
+        conn.execute(
             "UPDATE tasks SET status='failed', error=?, finished_at=? WHERE id=?",
             params![error, now_ms(), task_id],
-        );
-    }
+        )
+        .map_err(|e| e.to_string())?;
+        Ok(())
+    });
 }
 
 #[derive(Debug, Serialize)]
@@ -177,32 +196,33 @@ pub struct TaskSummary {
 
 pub fn list_tasks(app: tauri::AppHandle) -> Result<Vec<TaskSummary>, String> {
     let _ = app;
-    let conn = open()?;
-    let mut stmt = conn
-        .prepare(
-            "SELECT id, src, dst, status, total_rows, succeeded, failed, elapsed_ms,
-                    started_at, finished_at, error
-             FROM tasks ORDER BY started_at DESC LIMIT 200",
-        )
-        .map_err(|e| e.to_string())?;
-    let rows = stmt
-        .query_map([], |r| {
-            Ok(TaskSummary {
-                id: r.get(0)?,
-                src: r.get(1)?,
-                dst: r.get(2)?,
-                status: r.get(3)?,
-                total_rows: r.get(4)?,
-                succeeded: r.get(5)?,
-                failed: r.get(6)?,
-                elapsed_ms: r.get(7)?,
-                started_at: r.get(8)?,
-                finished_at: r.get(9)?,
-                error: r.get(10)?,
+    with_conn(|conn| {
+        let mut stmt = conn
+            .prepare(
+                "SELECT id, src, dst, status, total_rows, succeeded, failed, elapsed_ms,
+                        started_at, finished_at, error
+                 FROM tasks ORDER BY started_at DESC LIMIT 200",
+            )
+            .map_err(|e| e.to_string())?;
+        let rows = stmt
+            .query_map([], |r| {
+                Ok(TaskSummary {
+                    id: r.get(0)?,
+                    src: r.get(1)?,
+                    dst: r.get(2)?,
+                    status: r.get(3)?,
+                    total_rows: r.get(4)?,
+                    succeeded: r.get(5)?,
+                    failed: r.get(6)?,
+                    elapsed_ms: r.get(7)?,
+                    started_at: r.get(8)?,
+                    finished_at: r.get(9)?,
+                    error: r.get(10)?,
+                })
             })
-        })
-        .map_err(|e| e.to_string())?;
-    rows.collect::<Result<Vec<_>, _>>().map_err(|e| e.to_string())
+            .map_err(|e| e.to_string())?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(|e| e.to_string())
+    })
 }
 
 #[derive(Debug, Serialize)]
@@ -219,22 +239,23 @@ pub fn task_logs(
     limit: usize,
 ) -> Result<Vec<LogRow>, String> {
     let _ = app;
-    let conn = open()?;
-    let mut stmt = conn
-        .prepare(
-            "SELECT ts, level, table_name, message FROM task_logs
-             WHERE task_id = ? ORDER BY id ASC LIMIT ?",
-        )
-        .map_err(|e| e.to_string())?;
-    let rows = stmt
-        .query_map(params![task_id, limit as i64], |r| {
-            Ok(LogRow {
-                ts: r.get(0)?,
-                level: r.get(1)?,
-                table_name: r.get(2)?,
-                message: r.get(3)?,
+    with_conn(|conn| {
+        let mut stmt = conn
+            .prepare(
+                "SELECT ts, level, table_name, message FROM task_logs
+                 WHERE task_id = ? ORDER BY id ASC LIMIT ?",
+            )
+            .map_err(|e| e.to_string())?;
+        let rows = stmt
+            .query_map(params![task_id, limit as i64], |r| {
+                Ok(LogRow {
+                    ts: r.get(0)?,
+                    level: r.get(1)?,
+                    table_name: r.get(2)?,
+                    message: r.get(3)?,
+                })
             })
-        })
-        .map_err(|e| e.to_string())?;
-    rows.collect::<Result<Vec<_>, _>>().map_err(|e| e.to_string())
+            .map_err(|e| e.to_string())?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(|e| e.to_string())
+    })
 }

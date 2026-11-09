@@ -1,5 +1,5 @@
-import { useMemo, useState } from "react";
-import type { CursorMode, TableRow } from "../lib/types";
+import { useEffect, useMemo, useState } from "react";
+import type { CursorMode, OptionsForm, PreflightReport, TableRow } from "../lib/types";
 import {
   type GlobalCursor,
   type TableCursor,
@@ -10,6 +10,7 @@ import {
 } from "../lib/cursor";
 import { cn, formatInt } from "../lib/format";
 import { Badge, Button, Spinner } from "./ui";
+import { SyncOptionsModal } from "./SyncOptionsModal";
 
 type SortKey = "name" | "rows";
 
@@ -20,6 +21,8 @@ export function BatchView({
   onChange,
   global,
   onGlobalChange,
+  options,
+  onOptionsChange,
   batchSize,
   maxBatchSize,
   adaptiveBatch,
@@ -32,12 +35,17 @@ export function BatchView({
   canStart,
   running,
   hasReport,
+  report,
+  onSyncSchema,
+  syncingSchema,
 }: {
   rows: TableRow[];
   overrides: Record<string, TableCursor>;
   onChange: (table: string, ov: TableCursor) => void;
   global: GlobalCursor;
   onGlobalChange: (g: GlobalCursor) => void;
+  options: OptionsForm;
+  onOptionsChange: (options: OptionsForm) => void;
   /** 初始批大小（自适应开启时以此为起点） */
   batchSize: number;
   /** 一批最多多少行。宽表会自动压到 65535/列数，可能低于这个值 */
@@ -52,6 +60,9 @@ export function BatchView({
   canStart: boolean;
   running: boolean;
   hasReport: boolean;
+  report?: PreflightReport | null;
+  onSyncSchema?: () => void;
+  syncingSchema?: boolean;
 }) {
   const [selected, setSelected] = useState<Set<string>>(new Set());
   const [batchStart, setBatchStart] = useState("");
@@ -59,6 +70,7 @@ export function BatchView({
   const [batchMode, setBatchMode] = useState<CursorMode | "">("");
   const [detail, setDetail] = useState<string | null>(null);
   const [sort, setSort] = useState<SortKey>("name");
+  const [showOptions, setShowOptions] = useState(false);
 
   const sorted = useMemo(() => {
     const list = [...rows];
@@ -72,8 +84,34 @@ export function BatchView({
 
   const est = (t: TableRow) =>
     estimateRows(t, resolveCursor(t, overrides[t.name], global));
-  const totalEst = rows.reduce((s, t) => s + (est(t) ?? 0), 0);
+  const getTableRowEst = (t: TableRow) => {
+    const pt = report?.tables.find((p) => p.table === t.name);
+    if (pt?.planned_rows !== undefined && pt.planned_rows !== null) {
+      return pt.planned_rows;
+    }
+    return est(t);
+  };
+  const totalEst = rows.reduce((s, t) => s + (getTableRowEst(t) ?? 0), 0);
   const overrideCount = rows.filter((t) => hasOverride(overrides[t.name])).length;
+
+  const hasSchemaChanges = useMemo(() => {
+    if (!report) return false;
+    return report.tables.some(
+      (t) =>
+        (t.needs_create_table && t.create_table) ||
+        (t.alter_sqls && t.alter_sqls.length > 0)
+    );
+  }, [report]);
+
+  const schemaChangesDesc = useMemo(() => {
+    if (!report) return "";
+    const newT = report.tables.filter((t) => t.needs_create_table && t.create_table).length;
+    const altC = report.tables.reduce((s, t) => s + (t.alter_sqls?.length || 0), 0);
+    const parts: string[] = [];
+    if (newT > 0) parts.push(`建表 ${newT}`);
+    if (altC > 0) parts.push(`补列 ${altC}`);
+    return parts.join(" · ");
+  }, [report]);
 
   function applyBatch() {
     const targets = selected.size > 0 ? [...selected] : rows.map((r) => r.name);
@@ -122,6 +160,17 @@ export function BatchView({
             {preflighting && <Spinner />}
             {preflighting ? "预检中…" : "预检"}
           </Button>
+          {hasSchemaChanges && onSyncSchema && (
+            <Button
+              onClick={onSyncSchema}
+              disabled={syncingSchema || running}
+              className="!border-[#2d4d35] !bg-[#152a1c] !text-[var(--color-ok)] hover:!bg-[#1c3825]"
+              title="仅在目标端创建缺失表或补全新增列，不搬运数据"
+            >
+              {syncingSchema ? <Spinner /> : null}
+              {syncingSchema ? "结构同步中…" : `🧱 先同步结构 (${schemaChangesDesc})`}
+            </Button>
+          )}
           <Button
             variant="primary"
             onClick={onStart}
@@ -245,6 +294,39 @@ export function BatchView({
             ? "按耗时自动爬升，不会超过「最多」"
             : "固定用「批大小」，不自动调整"}
         </span>
+        <span className="text-[#3b4354]">|</span>
+        <label
+          className={cn(
+            "flex cursor-pointer items-center gap-1.5 rounded px-2 py-0.5 text-[11px] transition-colors border",
+            options.truncate_target
+              ? "bg-[#2b1812] text-[#fca5a5] border-[#5c2a23]"
+              : "border-transparent text-[var(--color-muted)] hover:text-[var(--color-text)]"
+          )}
+          title="勾选后，在同步数据之前先执行 TRUNCATE TABLE 清空目标表"
+        >
+          <input
+            type="checkbox"
+            checked={!!options.truncate_target}
+            disabled={running}
+            onChange={(e) =>
+              onOptionsChange({ ...options, truncate_target: e.target.checked })
+            }
+            className="h-3 w-3 accent-[#ef4444]"
+          />
+          <span className={cn(options.truncate_target ? "font-medium text-[#f87171]" : "")}>
+            清空目标表 (TRUNCATE)
+          </span>
+        </label>
+        <div className="ml-auto flex items-center gap-2">
+          <Button
+            disabled={running}
+            onClick={() => setShowOptions(true)}
+            className="!py-0.5 !px-2 !text-[10.5px] !border-[#2c3547] !bg-[#1c2230] text-[var(--color-text)] hover:!bg-[#262e40]"
+            title="设置多表并行度、外键检查、SQL 模式等高级参数"
+          >
+            ⚙ 高级设置
+          </Button>
+        </div>
       </div>
       </div>
 
@@ -306,9 +388,10 @@ export function BatchView({
             {sorted.map((t) => {
               const ov = overrides[t.name] ?? {};
               const eff = resolveCursor(t, ov, global);
-              const rowEst = est(t);
+              const rowEst = getTableRowEst(t);
               const on = selected.has(t.name);
               const overridden = hasOverride(ov);
+              const willTruncate = ov.truncate_target ?? options.truncate_target;
               const exceedsMax =
                 t.max_pk != null &&
                 eff.endId != null &&
@@ -316,8 +399,9 @@ export function BatchView({
               return (
                 <tr
                   key={t.name}
+                  onDoubleClick={() => setDetail(t.name)}
                   className={cn(
-                    "border-b border-[#1e222b]",
+                    "border-b border-[#1e222b] cursor-pointer",
                     on && "bg-[#141c2b]",
                     !on && "hover:bg-[#151922]",
                   )}
@@ -346,10 +430,26 @@ export function BatchView({
                     >
                       {t.name}
                     </button>
+                    {ov.dst_table && (
+                      <span
+                        className="ml-1 text-[10px] text-[var(--color-accent)] font-mono"
+                        title={`目标表映射为: ${ov.dst_table}`}
+                      >
+                        → {ov.dst_table}
+                      </span>
+                    )}
+                    {willTruncate && (
+                      <span
+                        className="ml-1 rounded bg-[#331714] px-1 py-0.2 text-[9.5px] font-medium text-[#f87171] border border-[#6b2c23]"
+                        title="同步前将执行 TRUNCATE TABLE 清空目标表"
+                      >
+                        TRUNCATE
+                      </span>
+                    )}
                     {overridden && (
                       <span
                         className="ml-1 text-[9px] text-[var(--color-accent)]"
-                        title="有独立游标设置"
+                        title="有独立游标或表名设置"
                       >
                         ●
                       </span>
@@ -430,13 +530,23 @@ export function BatchView({
                     )}
                   </td>
                   <td className="px-2 py-1 text-right">
-                    <button
-                      type="button"
-                      onClick={() => onRemove(t.name)}
-                      className="text-[10.5px] text-[var(--color-muted)] hover:text-[var(--color-err)]"
-                    >
-                      移除
-                    </button>
+                    <div className="flex items-center justify-end gap-1">
+                      <button
+                        type="button"
+                        onClick={() => setDetail(t.name)}
+                        className="rounded p-0.5 text-[10px] text-[var(--color-muted)] hover:text-[var(--color-accent)] hover:bg-[#202634]"
+                        title="设置表游标与目标表名"
+                      >
+                        ⚙
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() => onRemove(t.name)}
+                        className="text-[10.5px] text-[var(--color-muted)] hover:text-[var(--color-err)] px-1"
+                      >
+                        移除
+                      </button>
+                    </div>
                   </td>
                 </tr>
               );
@@ -448,13 +558,20 @@ export function BatchView({
       {/* 底部汇总 */}
       <div className="flex shrink-0 items-center gap-3 border-t border-[var(--color-border)] bg-[var(--color-panel)] px-3 py-1.5 text-[11px] text-[var(--color-muted)]">
         <span>
-          预计同步 <b className="text-[var(--color-text)]">{formatInt(totalEst)}</b> 行
+          已选 <b className="text-[var(--color-text)]">{rows.length}</b> 张
+          <span className="text-[#5c6478] ml-1">
+            (源物理总计 {formatInt(rows.reduce((s, t) => s + (t.rows_estimate || 0), 0))} 行)
+          </span>
+        </span>
+        <span className="text-[#3b4354]">|</span>
+        <span>
+          预计同步 <b className="text-[var(--color-accent)]">{formatInt(totalEst)}</b> 行
         </span>
         <span className="text-[#5c6478]">
-          {overrideCount} 张自定义 · {rows.length - overrideCount} 张跟随全局
+          ({overrideCount} 张自定义 · {rows.length - overrideCount} 张跟随全局)
         </span>
         <span className="ml-auto text-[10px] text-[#5c6478]">
-          行数是按主键区间粗估，以预检为准
+          以预检结果为准
         </span>
       </div>
 
@@ -463,6 +580,7 @@ export function BatchView({
           row={detailRow}
           ov={overrides[detailRow.name] ?? {}}
           global={global}
+          options={options}
           onChange={(ov) => onChange(detailRow.name, ov)}
           onClose={() => setDetail(null)}
           siblings={rows.filter((r) => r.name !== detailRow.name)}
@@ -470,6 +588,14 @@ export function BatchView({
           overrides={overrides}
         />
       )}
+
+      <SyncOptionsModal
+        open={showOptions}
+        options={options}
+        onChange={onOptionsChange}
+        onClose={() => setShowOptions(false)}
+        disabled={running}
+      />
     </div>
   );
 }
@@ -479,6 +605,7 @@ function TableDetailPanel({
   row,
   ov,
   global,
+  options,
   onChange,
   onClose,
   siblings,
@@ -488,6 +615,7 @@ function TableDetailPanel({
   row: TableRow;
   ov: TableCursor;
   global: GlobalCursor;
+  options: OptionsForm;
   onChange: (ov: TableCursor) => void;
   onClose: () => void;
   siblings: TableRow[];
@@ -498,6 +626,14 @@ function TableDetailPanel({
   const est = estimateRows(row, eff);
   const endBelowMax =
     row.max_pk != null && eff.endId != null && Number(eff.endId) < row.max_pk;
+
+  useEffect(() => {
+    const handleKeyDown = (e: KeyboardEvent) => {
+      if (e.key === "Escape") onClose();
+    };
+    window.addEventListener("keydown", handleKeyDown);
+    return () => window.removeEventListener("keydown", handleKeyDown);
+  }, [onClose]);
 
   const modes: { key: CursorMode; title: string; desc: string }[] = [
     { key: "custom", title: "自定义区间", desc: "从指定 id 开始，到指定 id 结束" },
@@ -526,6 +662,44 @@ function TableDetailPanel({
       </div>
 
       <div className="min-h-0 flex-1 overflow-y-auto p-3">
+        <div className="mb-2 text-[10.5px] font-semibold uppercase tracking-wide text-[var(--color-muted)]">
+          目标表名映射
+        </div>
+        <div className="mb-3 flex items-center gap-2">
+          <label className="w-[52px] shrink-0 text-[11px] text-[var(--color-muted)]">
+            目标表
+          </label>
+          <input
+            value={ov.dst_table ?? ""}
+            onChange={(e) => onChange({ ...ov, dst_table: e.target.value })}
+            placeholder={row.name + "（留空为同名）"}
+            spellCheck={false}
+            className="flex-1 !text-[11.5px]"
+          />
+          <span className="w-[110px] shrink-0 text-[10px] text-[#5c6478]">
+            留空与源同名
+          </span>
+        </div>
+
+        <div className="mb-2 text-[10.5px] font-semibold uppercase tracking-wide text-[var(--color-muted)]">
+          目标表数据清理
+        </div>
+        <div className="mb-3 flex items-center gap-2 bg-[#13171e] p-2 rounded-lg border border-[#202530]">
+          <span className="text-[11px] text-[var(--color-muted)]">清空已有数据：</span>
+          <select
+            value={ov.truncate_target === true ? "true" : ov.truncate_target === false ? "false" : ""}
+            onChange={(e) => {
+              const val = e.target.value === "true" ? true : e.target.value === "false" ? false : undefined;
+              onChange({ ...ov, truncate_target: val });
+            }}
+            className="!py-0.5 !text-[11px]"
+          >
+            <option value="">跟随全局（当前: {options.truncate_target ? "清空" : "不清空"}）</option>
+            <option value="true">清空目标表 (TRUNCATE TABLE)</option>
+            <option value="false">保留目标表数据 (不清空)</option>
+          </select>
+        </div>
+
         <div className="mb-2 text-[10.5px] font-semibold uppercase tracking-wide text-[var(--color-muted)]">
           游标模式
         </div>
@@ -579,7 +753,7 @@ function TableDetailPanel({
               className="flex-1 !text-[11.5px]"
             />
             <span className="w-[110px] shrink-0 text-[10px] text-[#5c6478]">
-              不含此行
+              含此行 (闭区间)
             </span>
           </div>
           <div className="flex items-center gap-2">
@@ -595,7 +769,7 @@ function TableDetailPanel({
               className="flex-1 !text-[11.5px]"
             />
             <span className="w-[110px] shrink-0 text-[10px] text-[#5c6478]">
-              含此行
+              含此行 (闭区间)
             </span>
           </div>
         </div>
