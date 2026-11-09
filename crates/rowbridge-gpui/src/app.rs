@@ -469,8 +469,8 @@ impl RowBridgeApp {
                             DbSide::Src => this.src_schemas = list,
                             DbSide::Dst => this.dst_schemas = list,
                         }
-                        this.panel_mut(side).note =
-                            Some((true, format!("{count} 个库").into()));
+                        let _ = count;
+                        this.panel_mut(side).note = None;
                         this.auto_pick_schema(side);
                         if side == DbSide::Src && this.src_schema.is_some() {
                             this.load_tables(cx);

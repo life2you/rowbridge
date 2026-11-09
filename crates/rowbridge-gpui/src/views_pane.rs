@@ -1,8 +1,8 @@
-//! 三栏面板：连接编辑、库列表、表列表、批次选项与进度。
+//! 三栏面板：连接、库表、批次选项、进度。
 
 use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::{
-    checkbox::Checkbox, input::Input, progress::Progress, scroll::ScrollableElement as _, *,
+    checkbox::Checkbox, input::Input, scroll::ScrollableElement as _, Icon, IconName, *,
 };
 use gpui_kit::*;
 use rowbridge_core::config::CursorStart;
@@ -10,35 +10,52 @@ use rowbridge_core::preflight::Severity;
 
 use crate::app::RowBridgeApp;
 use crate::model::*;
-use crate::views::{badge, label, section_title};
+use crate::views::{card_head, chip, divider, field_label, label, mono, panel_card};
 
 impl RowBridgeApp {
     pub(crate) fn side_pane(&self, side: DbSide, cx: &mut Context<Self>) -> AnyElement {
         let border = cx.theme().border;
-        let mut pane = v_flex()
-            .w(px(300.))
+        let card_bg = cx.theme().title_bar;
+        let muted = cx.theme().muted_foreground;
+        let success = cx.theme().success;
+        let accent = cx.theme().accent;
+
+        let (icon, connected) = match side {
+            DbSide::Src => (IconName::Network, !self.src_schemas.is_empty()),
+            DbSide::Dst => (IconName::HardDrive, !self.dst_schemas.is_empty()),
+        };
+
+        let mut head = card_head(side.title(), icon, muted, border);
+        head = head
+            .child(div().flex_1())
+            .child(chip(
+                if connected { "已连接" } else { "未连接" },
+                if connected { success } else { muted },
+                accent,
+            ));
+
+        let mut body = v_flex().flex_1().min_h_0().gap_3().p_3();
+        body = body.child(self.conn_editor(side, cx));
+        body = body.child(divider(border));
+        body = body.child(self.schema_section(side, cx));
+        body = body.child(divider(border));
+        body = match side {
+            DbSide::Src => body.child(self.table_section(cx)),
+            DbSide::Dst => body.child(self.dst_section(cx)),
+        };
+
+        panel_card(card_bg, border)
+            .w(px(304.))
             .h_full()
-            .min_h_0()
             .flex_shrink_0()
-            .border_color(border);
-        pane = match side {
-            DbSide::Src => pane.border_r_1(),
-            DbSide::Dst => pane.border_l_1(),
-        };
-        let mut pane = pane
-            .child(self.conn_editor(side, cx))
-            .child(self.schema_list(side, cx));
-        pane = match side {
-            DbSide::Src => pane.child(self.table_list(cx)),
-            DbSide::Dst => pane.child(self.dst_stats(cx)),
-        };
-        pane.into_any_element()
+            .child(head)
+            .child(body)
+            .into_any_element()
     }
 
-    // ------------------------------------------------------------ 连接编辑
+    // ------------------------------------------------------------ 连接
 
     fn conn_editor(&self, side: DbSide, cx: &mut Context<Self>) -> AnyElement {
-        let fg = cx.theme().foreground;
         let muted = cx.theme().muted_foreground;
         let success = cx.theme().success;
         let danger = cx.theme().danger;
@@ -48,97 +65,149 @@ impl RowBridgeApp {
             DbSide::Dst => "dst",
         };
 
-        let mut note = h_flex().min_h(px(16.));
-        match &panel.note {
-            Some((ok, msg)) => {
-                note = note.child(label(
-                    msg.clone(),
-                    if *ok { success } else { danger },
-                ));
-            }
-            None => {
-                note = note.child(label("", muted));
-            }
-        }
+        let mut block = v_flex().flex_shrink_0().gap_2();
 
-        let mut block = v_flex()
-            .flex_shrink_0()
-            .gap_2()
-            .p_3()
+        // 已保存数据源
+        block = block.child(
+            v_flex()
+                .gap_1()
+                .child(field_label("已保存数据源", muted))
+                .child(self.saved_chips(side, cx)),
+        );
+
+        // 主机 / 端口
+        block = block.child(
+            h_flex()
+                .gap_2()
+                .items_end()
+                .child(
+                    v_flex()
+                        .flex_1()
+                        .min_w_0()
+                        .gap_1()
+                        .child(field_label("主机", muted))
+                        .child(Input::new(&panel.host).small()),
+                )
+                .child(
+                    v_flex()
+                        .w(px(84.))
+                        .gap_1()
+                        .child(field_label("端口", muted))
+                        .child(Input::new(&panel.port).small()),
+                ),
+        );
+
+        // 用户 / 密码
+        block = block.child(
+            h_flex()
+                .gap_2()
+                .items_end()
+                .child(
+                    v_flex()
+                        .flex_1()
+                        .min_w_0()
+                        .gap_1()
+                        .child(field_label("用户", muted))
+                        .child(Input::new(&panel.user).small()),
+                )
+                .child(
+                    v_flex()
+                        .flex_1()
+                        .min_w_0()
+                        .gap_1()
+                        .child(field_label("密码", muted))
+                        .child(Input::new(&panel.password).small()),
+                ),
+        );
+
+        // TLS + 动作
+        block = block.child(
+            h_flex()
+                .gap_2()
+                .items_center()
+                .child(
+                    Checkbox::new(format!("tls-{tag}"))
+                        .small()
+                        .checked(panel.use_tls)
+                        .label("TLS")
+                        .on_change(cx.listener(move |this, checked, _, cx| {
+                            this.panel_mut(side).use_tls = *checked;
+                            cx.notify();
+                        })),
+                )
+                .child(div().flex_1())
+                .child(
+                    Button::new(format!("test-{tag}"))
+                        .xsmall()
+                        .ghost()
+                        .icon(IconName::Network)
+                        .label("测试")
+                        .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
+                            this.test_conn(side, cx);
+                            cx.notify();
+                        })),
+                )
+                .child(
+                    Button::new(format!("load-{tag}"))
+                        .xsmall()
+                        .outline()
+                        .icon(IconName::RefreshCw)
+                        .label("加载库")
+                        .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
+                            this.load_schemas(side, cx);
+                            cx.notify();
+                        })),
+                )
+                .child(
+                    Button::new(format!("save-{tag}"))
+                        .xsmall()
+                        .ghost()
+                        .icon(IconName::Plus)
+                        .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
+                            this.save_current(side, cx);
+                            cx.notify();
+                        })),
+                ),
+        );
+
+        let note_color = match &panel.note {
+            Some((true, _)) => success,
+            Some((false, _)) => danger,
+            None => muted,
+        };
+        let note_text = match &panel.note {
+            Some((_, msg)) => msg.clone(),
+            None => match (&panel.label, panel.busy) {
+                (_, true) => "连接中…".into(),
+                (Some(name), _) => format!("当前数据源：{name}").into(),
+                (None, _) => "未选择已保存的数据源".into(),
+            },
+        };
+        block
             .child(
                 h_flex()
+                    .gap_1()
                     .items_center()
-                    .justify_between()
-                    .child(section_title(side.title(), fg))
-                    .child(label(
-                        if panel.busy { "连接中…" } else { "" },
-                        muted,
-                    )),
+                    .min_h(px(16.))
+                    .child(Icon::new(IconName::CircleAlert).xsmall().text_color(note_color))
+                    .child(label(note_text, note_color)),
             )
-            .child(self.saved_chips(side, cx))
-            .child(
-                h_flex()
-                    .gap_2()
-                    .child(div().flex_1().min_w_0().child(Input::new(&panel.host).small()))
-                    .child(div().w(px(84.)).child(Input::new(&panel.port).small())),
-            )
-            .child(
-                h_flex()
-                    .gap_2()
-                    .child(div().flex_1().min_w_0().child(Input::new(&panel.user).small()))
-                    .child(div().flex_1().min_w_0().child(Input::new(&panel.password).small())),
-            )
-            .child(
-                h_flex()
-                    .gap_2()
-                    .items_center()
-                    .child(
-                        Checkbox::new(format!("tls-{tag}"))
-                            .small()
-                            .checked(panel.use_tls)
-                            .label("TLS")
-                            .on_change(cx.listener(move |this, checked, _, cx| {
-                                this.panel_mut(side).use_tls = *checked;
-                                cx.notify();
-                            })),
-                    )
-                    .child(div().flex_1())
-                    .child(
-                        Button::new(format!("test-{tag}"))
-                            .xsmall()
-                            .label("测试")
-                            .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
-                                this.test_conn(side, cx);
-                                cx.notify();
-                            })),
-                    )
-                    .child(
-                        Button::new(format!("load-{tag}"))
-                            .xsmall()
-                            .label("加载库")
-                            .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
-                                this.load_schemas(side, cx);
-                                cx.notify();
-                            })),
-                    )
-                    .child(
-                        Button::new(format!("save-{tag}"))
-                            .xsmall()
-                            .ghost()
-                            .label("保存")
-                            .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
-                                this.save_current(side, cx);
-                                cx.notify();
-                            })),
-                    ),
-            )
-            .child(note);
+            .into_any_element()
+    }
 
-        if let Some(name) = &panel.label {
-            block = block.child(label(format!("数据源：{name}"), muted));
+    fn set_toggle(&mut self, key: &str, value: bool) {
+        match key {
+            "create-table" => self.opt.create_table = value,
+            "create-db" => self.opt.create_database = value,
+            "strip-fk" => self.opt.strip_foreign_keys = value,
+            "strip-ai" => self.opt.strip_auto_increment = value,
+            "map-coll" => self.opt.map_collation = value,
+            "fk-off" => self.opt.disable_foreign_key_checks = value,
+            "truncate" => self.opt.truncate_target = value,
+            "relax-sql" => self.opt.relax_sql_mode = value,
+            "continue" => self.opt.continue_on_error = value,
+            _ => {}
         }
-
-        block.into_any_element()
     }
 
     fn saved_chips(&self, side: DbSide, cx: &mut Context<Self>) -> AnyElement {
@@ -149,7 +218,7 @@ impl RowBridgeApp {
         };
         let mut row = h_flex().gap_1().flex_wrap();
         if self.saved.is_empty() {
-            row = row.child(label("暂无已保存数据源", muted));
+            row = row.child(label("暂无", muted));
         } else {
             for conn in self.saved.iter().take(6) {
                 let id = conn.id.clone();
@@ -169,14 +238,12 @@ impl RowBridgeApp {
         row.into_any_element()
     }
 
-    // ------------------------------------------------------------ 库列表
+    // ------------------------------------------------------------ 数据库列表
 
-    fn schema_list(&self, side: DbSide, cx: &mut Context<Self>) -> AnyElement {
-        let fg = cx.theme().foreground;
+    fn schema_section(&self, side: DbSide, cx: &mut Context<Self>) -> AnyElement {
         let muted = cx.theme().muted_foreground;
-        let primary = cx.theme().primary;
-        let primary_fg = cx.theme().primary_foreground;
-        let hover_bg = cx.theme().muted;
+        let border = cx.theme().border;
+        let hover_bg = cx.theme().accent;
         let current = self.schema(side);
         let schemas = self.schemas(side).to_vec();
 
@@ -189,61 +256,78 @@ impl RowBridgeApp {
             let selected = current.as_deref() == Some(name.as_str());
             let mut row = h_flex()
                 .id(format!("sc-{}-{name}", side as u8))
+                .h(px(26.))
                 .px_2()
-                .py_1()
                 .rounded_md()
+                .items_center()
+                .gap_2()
                 .cursor_pointer()
                 .text_xs()
-                .child(name.clone());
+                .child(Icon::new(IconName::Network).xsmall())
+                .child(div().flex_1().min_w_0().child(name.clone()));
             row = if selected {
-                row.bg(primary).text_color(primary_fg)
+                row.bg(cx.theme().list_active)
+                    .text_color(cx.theme().foreground)
+                    .font_weight(FontWeight::MEDIUM)
             } else {
-                row.hover(move |s| s.bg(hover_bg))
+                row.text_color(muted).hover(move |s| s.bg(hover_bg))
             };
-            rows = rows.child(row.on_click(
-                cx.listener(move |this, _: &ClickEvent, _, cx| {
+            if selected {
+                row = row.child(Icon::new(IconName::Check).xsmall());
+            }
+            rows = rows.child(row.on_click(cx.listener(
+                move |this, _: &ClickEvent, _, cx| {
                     this.choose_schema(side, &name, cx);
                     cx.notify();
-                }),
-            ));
+                },
+            )));
         }
 
         v_flex()
             .flex_shrink_0()
-            .gap_1()
-            .px_3()
-            .pb_2()
-            .child(section_title("数据库", fg))
+            .gap_2()
+            .child(
+                h_flex()
+                    .items_center()
+                    .gap_2()
+                    .child(field_label("数据库", muted))
+                    .child(div().flex_1())
+                    .child(label(format!("{} 个", self.schemas(side).len()), muted)),
+            )
             .child(
                 div()
                     .id(format!("schema-{:?}", side as u8))
-                    .max_h(px(180.))
+                    .max_h(px(150.))
                     .overflow_y_scrollbar()
+                    .rounded_md()
                     .child(rows),
             )
+            .border_color(border)
             .into_any_element()
     }
 
-    // ------------------------------------------------------------ 表列表
+    // ------------------------------------------------------------ 表清单
 
-    fn table_list(&self, cx: &mut Context<Self>) -> AnyElement {
-        let fg = cx.theme().foreground;
+    fn table_section(&self, cx: &mut Context<Self>) -> AnyElement {
         let muted = cx.theme().muted_foreground;
         let danger = cx.theme().danger;
-        let selected_bg = cx.theme().muted;
-        let border = cx.theme().border;
+        let accent = cx.theme().accent;
+        let hover_bg = cx.theme().accent;
+        let selected_bg = cx.theme().list_active;
 
-        let mut header = h_flex()
+        let mut head = h_flex()
             .items_center()
-            .justify_between()
-            .px_3()
-            .pt_2()
-            .pb_1()
-            .child(section_title(
-                format!("表 · 已选 {}", self.selected_count()),
-                fg,
-            ));
-        header = header
+            .gap_2()
+            .child(Icon::new(IconName::Frame).xsmall().text_color(muted))
+            .child(
+                div()
+                    .text_xs()
+                    .font_weight(FontWeight::MEDIUM)
+                    .child(format!("表 · 已选 {}", self.selected_count())),
+            )
+            .child(div().flex_1());
+
+        head = head
             .child(
                 Button::new("sel-all")
                     .xsmall()
@@ -265,11 +349,17 @@ impl RowBridgeApp {
                     })),
             );
 
-        let mut list = v_flex().gap_1().px_2().pb_3();
+        let mut list = v_flex().gap_0p5();
         if self.loading_tables {
-            list = list.child(label("加载表清单…", muted));
+            list = list.child(
+                h_flex()
+                    .gap_2()
+                    .items_center()
+                    .child(Icon::new(IconName::Loader).xsmall().text_color(muted))
+                    .child(label("加载表清单…", muted)),
+            );
         } else if self.tables.is_empty() {
-            list = list.child(label("选择左侧数据库后自动加载", muted));
+            list = list.child(label("选择数据库后自动加载表清单", muted));
         }
         for (i, row) in self.tables.iter().enumerate() {
             let name = row.name.clone();
@@ -277,14 +367,15 @@ impl RowBridgeApp {
             let selected = row.selected;
             let disabled = row.unsupported.is_some();
             let mut item = h_flex()
+                .h(px(24.))
                 .gap_2()
                 .items_center()
                 .px_1()
-                .py_1()
-                .rounded_md()
+                .rounded_sm()
+                .hover(move |s| s.bg(hover_bg))
                 .child(
                     Checkbox::new(format!("tbl-{i}"))
-                        .small()
+                        .xsmall()
                         .checked(selected)
                         .disabled(disabled)
                         .on_change(cx.listener(move |this, checked, _, cx| {
@@ -292,13 +383,22 @@ impl RowBridgeApp {
                             cx.notify();
                         })),
                 )
-                .child(div().flex_1().min_w_0().text_xs().child(name.clone()))
-                .child(label(human_rows(row.rows_estimate), muted));
+                .child(div().flex_1().min_w_0().text_xs().truncate().child(name.clone()))
+                .child(
+                    div()
+                        .w(px(64.))
+                        .text_right()
+                        .child(mono(human_rows(row.rows_estimate), muted)),
+                );
 
-            if let Some(reason) = &row.unsupported {
-                item = item.child(badge(reason.clone(), danger, selected_bg));
-            } else if let Some(pk) = &row.primary_key {
-                item = item.child(label(format!("PK {pk}"), muted));
+            match (&row.unsupported, &row.primary_key) {
+                (Some(reason), _) => {
+                    item = item.child(chip(reason.clone(), danger, accent));
+                }
+                (None, Some(pk)) => {
+                    item = item.child(chip(format!("PK {pk}"), muted, accent));
+                }
+                _ => {}
             }
             if selected {
                 item = item.bg(selected_bg);
@@ -309,9 +409,8 @@ impl RowBridgeApp {
         v_flex()
             .flex_1()
             .min_h_0()
-            .border_t_1()
-            .border_color(border)
-            .child(header)
+            .gap_2()
+            .child(head)
             .child(
                 div()
                     .id("table-scroll")
@@ -323,12 +422,13 @@ impl RowBridgeApp {
             .into_any_element()
     }
 
-    fn dst_stats(&self, cx: &mut Context<Self>) -> AnyElement {
-        let fg = cx.theme().foreground;
+    // ------------------------------------------------------------ 目标状态
+
+    fn dst_section(&self, cx: &mut Context<Self>) -> AnyElement {
         let muted = cx.theme().muted_foreground;
-        let border = cx.theme().border;
         let success = cx.theme().success;
         let warning = cx.theme().warning;
+        let border = cx.theme().border;
 
         let create = self
             .report
@@ -347,39 +447,41 @@ impl RowBridgeApp {
             .unwrap_or(0);
         let has_schema_work = create > 0 || alter > 0;
 
-        let mut block = v_flex()
+        let stat = |name: &'static str, value: String, color: Hsla| -> AnyElement {
+            h_flex()
+                .justify_between()
+                .items_center()
+                .h(px(24.))
+                .child(label(name, muted))
+                .child(div().child(mono(value, color)))
+                .into_any_element()
+        };
+
+        v_flex()
             .flex_1()
             .min_h_0()
-            .gap_3()
-            .p_3()
-            .border_t_1()
-            .border_color(border)
-            .child(section_title("目标状态", fg))
+            .gap_2()
             .child(
-                v_flex()
-                    .gap_1()
+                h_flex()
+                    .items_center()
+                    .gap_2()
+                    .child(Icon::new(IconName::ChartPie).xsmall().text_color(muted))
                     .child(
-                        h_flex()
-                            .justify_between()
-                            .child(label("将新建表", muted))
-                            .child(label(create.to_string(), warning)),
-                    )
-                    .child(
-                        h_flex()
-                            .justify_between()
-                            .child(label("目标已有数据", muted))
-                            .child(label(existing.to_string(), success)),
-                    )
-                    .child(
-                        h_flex()
-                            .justify_between()
-                            .child(label("待补列", muted))
-                            .child(label(alter.to_string(), warning)),
+                        div()
+                            .text_xs()
+                            .font_weight(FontWeight::MEDIUM)
+                            .child("目标状态"),
                     ),
             )
+            .child(stat("将新建表", create.to_string(), warning))
+            .child(stat("已有数据", existing.to_string(), success))
+            .child(stat("待补列", alter.to_string(), warning))
+            .child(divider(border))
             .child(
                 Button::new("sync-schema")
                     .small()
+                    .outline()
+                    .icon(IconName::Replace)
                     .label(if self.syncing_schema {
                         "同步结构中…"
                     } else {
@@ -391,37 +493,154 @@ impl RowBridgeApp {
                         cx.notify();
                     })),
             )
-            .child(label(
-                "只建库 / 建表 / 补列，不搬运数据。",
-                muted,
-            ));
-
-        block = block.child(self.report_block(cx));
-        block.into_any_element()
+            .child(
+                div()
+                    .id("report-scroll")
+                    .flex_1()
+                    .min_h_0()
+                    .overflow_y_scrollbar()
+                    .child(self.report_block(cx)),
+            )
+            .into_any_element()
     }
 
-    // ------------------------------------------------------------ 中间批次区
+    // ------------------------------------------------------------ 中间：批次
 
     pub(crate) fn center_pane(&self, cx: &mut Context<Self>) -> AnyElement {
         v_flex()
             .flex_1()
-            .min_w(px(420.))
+            .min_w(px(430.))
+            .h_full()
             .min_h_0()
-            .child(self.batch_options(cx))
-            .child(self.selected_list(cx))
-            .child(self.editor_panel(cx))
-            .child(self.progress_block(cx))
+            .gap_2()
+            .child(self.batch_card(cx))
+            .child(self.progress_card(cx))
             .into_any_element()
     }
 
-    fn batch_options(&self, cx: &mut Context<Self>) -> AnyElement {
-        let fg = cx.theme().foreground;
-        let muted = cx.theme().muted_foreground;
+    fn batch_card(&self, cx: &mut Context<Self>) -> AnyElement {
         let border = cx.theme().border;
-        let primary = cx.theme().primary;
-        let primary_fg = cx.theme().primary_foreground;
+        let card_bg = cx.theme().title_bar;
+        let muted = cx.theme().muted_foreground;
+        let fg = cx.theme().foreground;
+        let accent = cx.theme().accent;
 
-        let mut cursor_row = h_flex().gap_1().items_center();
+        let mut head = card_head("同步批次", IconName::Replace, muted, border);
+        head = head.child(chip(
+            format!(
+                "已选 {} 张 · 估算 {} 行",
+                self.selected_count(),
+                human_rows(self.estimated_rows())
+            ),
+            muted,
+            accent,
+        ));
+
+        let src_label = self
+            .src_schema
+            .clone()
+            .unwrap_or_else(|| "源库".into());
+        let dst_label = self
+            .dst_schema
+            .clone()
+            .unwrap_or_else(|| "目标库".into());
+        head = head
+            .child(
+                h_flex()
+                    .gap_1()
+                    .items_center()
+                    .child(div().text_xs().text_color(muted).child(src_label))
+                    .child(Icon::new(IconName::ArrowRight).xsmall().text_color(muted))
+                    .child(div().text_xs().text_color(muted).child(dst_label)),
+            )
+            .child(div().flex_1());
+
+        if self.running {
+            head = head.child(
+                Button::new("do-cancel")
+                    .xsmall()
+                    .danger()
+                    .icon(IconName::Close)
+                    .label("取消同步")
+                    .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
+                        this.do_cancel();
+                        cx.notify();
+                    })),
+            );
+        } else {
+            head = head
+                .child(
+                    Button::new("do-preflight")
+                        .xsmall()
+                        .ghost()
+                        .icon(IconName::Search)
+                        .label(if self.preflighting { "预检中…" } else { "预检" })
+                        .disabled(!self.can_preflight())
+                        .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
+                            this.do_preflight(cx);
+                            cx.notify();
+                        })),
+                )
+                .child(
+                    Button::new("do-start")
+                        .xsmall()
+                        .primary()
+                        .icon(IconName::Play)
+                        .label("开始同步")
+                        .disabled(!self.can_start())
+                        .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
+                            this.do_start(cx);
+                            cx.notify();
+                        })),
+                );
+        }
+
+        let mut body = v_flex().flex_1().min_h_0().gap_2().p_3();
+        body = body
+            .child(self.options_row(cx))
+            .child(self.batch_row(cx));
+
+        if self.show_advanced {
+            body = body.child(self.advanced_grid(cx));
+        }
+
+        body = body
+            .child(divider(border))
+            .child(self.edit_hint(muted))
+            .child(
+                div()
+                    .id("selected-scroll")
+                    .flex_1()
+                    .min_h_0()
+                    .overflow_y_scrollbar()
+                    .child(self.selected_list(cx)),
+            );
+
+        if self.editing.is_some() {
+            body = body.child(self.editor_panel(cx));
+        }
+
+        panel_card(card_bg, border)
+            .flex_1()
+            .min_h_0()
+            .max_h(px(470.))
+            .child(head)
+            .child(body)
+            .child(
+                h_flex()
+                    .flex_shrink_0()
+                    .px_3()
+                    .pb_2()
+                    .child(label("", fg)),
+            )
+            .into_any_element()
+    }
+
+    fn options_row(&self, cx: &mut Context<Self>) -> AnyElement {
+        let muted = cx.theme().muted_foreground;
+        let accent = cx.theme().accent;
+
+        let mut seg = h_flex().gap_1().p_1().rounded_md().bg(accent);
         for mode in [CursorMode::Full, CursorMode::Resume, CursorMode::Custom] {
             let button = Button::new(format!("gm-{}", mode.label()))
                 .xsmall()
@@ -431,7 +650,7 @@ impl RowBridgeApp {
             } else {
                 button.ghost()
             };
-            cursor_row = cursor_row.child(button.on_click(cx.listener(
+            seg = seg.child(button.on_click(cx.listener(
                 move |this, _: &ClickEvent, _, cx| {
                     this.opt.cursor = mode;
                     this.invalidate_report();
@@ -440,140 +659,226 @@ impl RowBridgeApp {
             )));
         }
 
-        let mut block = v_flex()
+        let mut row = h_flex()
+            .gap_3()
+            .items_center()
             .flex_shrink_0()
-            .gap_2()
-            .p_3()
-            .border_b_1()
-            .border_color(border)
             .child(
                 h_flex()
+                    .gap_2()
                     .items_center()
-                    .justify_between()
-                    .child(section_title("同步批次", fg))
-                    .child(
-                        Button::new("adv-toggle")
-                            .xsmall()
-                            .ghost()
-                            .label(if self.show_advanced {
-                                "收起高级"
-                            } else {
-                                "高级选项"
-                            })
-                            .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
-                                this.show_advanced = !this.show_advanced;
-                                cx.notify();
-                            })),
-                    ),
+                    .child(field_label("全局游标", muted))
+                    .child(seg),
+            );
+
+        if self.opt.cursor == CursorMode::Custom {
+            row = row
+                .child(
+                    v_flex()
+                        .gap_1()
+                        .child(field_label("起始 ID（含）", muted))
+                        .child(div().w(px(120.)).child(Input::new(&self.opt.global_start).small())),
+                )
+                .child(
+                    v_flex()
+                        .gap_1()
+                        .child(field_label("结束 ID（含）", muted))
+                        .child(div().w(px(120.)).child(Input::new(&self.opt.global_end).small())),
+                );
+        }
+
+        row.into_any_element()
+    }
+
+    fn batch_row(&self, cx: &mut Context<Self>) -> AnyElement {
+        let muted = cx.theme().muted_foreground;
+
+        h_flex()
+            .gap_3()
+            .items_end()
+            .flex_shrink_0()
+            .child(
+                v_flex()
+                    .w(px(64.))
+                    .gap_1()
+                    .child(field_label("并发", muted))
+                    .child(Input::new(&self.opt.parallelism).small()),
+            )
+            .child(
+                v_flex()
+                    .w(px(90.))
+                    .gap_1()
+                    .child(field_label("批大小", muted))
+                    .child(Input::new(&self.opt.batch_size).small()),
+            )
+            .child(
+                v_flex()
+                    .w(px(96.))
+                    .gap_1()
+                    .child(field_label("批量上限", muted))
+                    .child(Input::new(&self.opt.max_batch_size).small()),
             )
             .child(
                 h_flex()
                     .gap_2()
                     .items_center()
-                    .child(label("全局游标", muted))
-                    .child(cursor_row),
-            );
+                    .h(px(30.))
+                    .child(
+                        Checkbox::new("adaptive")
+                            .small()
+                            .checked(self.opt.adaptive_batch)
+                            .label("自适应批大小")
+                            .on_change(cx.listener(|this, checked, _, cx| {
+                                this.opt.adaptive_batch = *checked;
+                                this.invalidate_report();
+                                cx.notify();
+                            })),
+                    ),
+            )
+            .child(div().flex_1())
+            .child(
+                Button::new("adv-toggle")
+                    .xsmall()
+                    .ghost()
+                    .icon(if self.show_advanced {
+                        IconName::ChevronDown
+                    } else {
+                        IconName::ChevronRight
+                    })
+                    .icon(IconName::Settings2)
+                    .label("高级选项")
+                    .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
+                        this.show_advanced = !this.show_advanced;
+                        cx.notify();
+                    })),
+            )
+            .into_any_element()
+    }
 
-        if self.opt.cursor == CursorMode::Custom {
-            block = block.child(
-                h_flex()
-                    .gap_2()
-                    .child(div().flex_1().min_w_0().child(Input::new(&self.opt.global_start).small()))
-                    .child(div().flex_1().min_w_0().child(Input::new(&self.opt.global_end).small())),
-            );
-        }
+    fn advanced_grid(&self, cx: &mut Context<Self>) -> AnyElement {
+        let accent = cx.theme().accent;
+        let toggles: [(&'static str, &str, bool); 9] = [
+            ("create-table", "自动建表", self.opt.create_table),
+            ("create-db", "自动建库", self.opt.create_database),
+            ("strip-fk", "移除外键约束", self.opt.strip_foreign_keys),
+            ("strip-ai", "移除自增属性", self.opt.strip_auto_increment),
+            ("map-coll", "collation 映射", self.opt.map_collation),
+            ("fk-off", "关闭外键检查", self.opt.disable_foreign_key_checks),
+            ("truncate", "清空目标表", self.opt.truncate_target),
+            ("relax-sql", "放宽 sql_mode", self.opt.relax_sql_mode),
+            ("continue", "失败继续其它表", self.opt.continue_on_error),
+        ];
 
-        block = block.child(
-            h_flex()
-                .gap_2()
-                .items_center()
-                .child(label("并发", muted))
-                .child(div().w(px(56.)).child(Input::new(&self.opt.parallelism).small()))
-                .child(label("批大小", muted))
-                .child(div().w(px(76.)).child(Input::new(&self.opt.batch_size).small()))
-                .child(label("上限", muted))
-                .child(div().w(px(84.)).child(Input::new(&self.opt.max_batch_size).small()))
-                .child(
-                    Checkbox::new("adaptive")
-                        .small()
-                        .checked(self.opt.adaptive_batch)
-                        .label("自适应")
-                        .on_change(cx.listener(|this, checked, _, cx| {
-                            this.opt.adaptive_batch = *checked;
-                            this.invalidate_report();
-                            cx.notify();
-                        })),
-                ),
-        );
-
-        if self.show_advanced {
-            let toggles: [(&'static str, &str, bool); 9] = [
-                ("create-table", "自动建表", self.opt.create_table),
-                ("create-db", "自动建库", self.opt.create_database),
-                ("strip-fk", "移除外键", self.opt.strip_foreign_keys),
-                ("strip-ai", "移除自增", self.opt.strip_auto_increment),
-                ("map-coll", "collation 映射", self.opt.map_collation),
-                ("fk-off", "关闭外键检查", self.opt.disable_foreign_key_checks),
-                ("truncate", "清空目标表", self.opt.truncate_target),
-                ("relax-sql", "放宽 sql_mode", self.opt.relax_sql_mode),
-                ("continue", "失败继续", self.opt.continue_on_error),
-            ];
-            let mut grid = v_flex().gap_1();
-            for chunk in toggles.chunks(2) {
-                let mut row = h_flex().gap_4();
-                for (id, text, value) in chunk {
-                    let id = id.to_string();
-                    let key = id.clone();
-                    row = row.child(
-                        div().w(px(150.)).child(
-                            Checkbox::new(format!("adv-{id}"))
-                                .small()
-                                .checked(*value)
-                                .label(text.to_string())
-                                .on_change(cx.listener(move |this, checked, _, cx| {
-                                    this.set_toggle(&key, *checked);
-                                    cx.notify();
-                                })),
-                        ),
-                    );
-                }
-                grid = grid.child(row);
+        let mut grid = v_flex().gap_1();
+        for chunk in toggles.chunks(3) {
+            let mut row = h_flex().gap_4();
+            for (id, text, value) in chunk {
+                let id = id.to_string();
+                let key = id.clone();
+                row = row.child(
+                    div().w(px(140.)).child(
+                        Checkbox::new(format!("adv-{id}"))
+                            .xsmall()
+                            .checked(*value)
+                            .label(text.to_string())
+                            .on_change(cx.listener(move |this, checked, _, cx| {
+                                this.set_toggle(&key, *checked);
+                                cx.notify();
+                            })),
+                    ),
+                );
             }
-            block = block.child(grid);
+            grid = grid.child(row);
         }
 
-        let _ = (primary, primary_fg);
-        block.into_any_element()
+        div()
+            .flex_shrink_0()
+            .p_2()
+            .rounded_md()
+            .bg(accent)
+            .child(grid)
+            .into_any_element()
     }
 
-    fn set_toggle(&mut self, key: &str, value: bool) {
-        match key {
-            "create-table" => self.opt.create_table = value,
-            "create-db" => self.opt.create_database = value,
-            "strip-fk" => self.opt.strip_foreign_keys = value,
-            "strip-ai" => self.opt.strip_auto_increment = value,
-            "map-coll" => self.opt.map_collation = value,
-            "fk-off" => self.opt.disable_foreign_key_checks = value,
-            "truncate" => self.opt.truncate_target = value,
-            "relax-sql" => self.opt.relax_sql_mode = value,
-            "continue" => self.opt.continue_on_error = value,
-            _ => {}
-        }
+    fn edit_hint(&self, muted: Hsla) -> AnyElement {
+        let count = self.selected_count();
+        let overridden = self
+            .tables
+            .iter()
+            .filter(|t| t.selected && t.over.cursor.is_some())
+            .count();
+        let text = if count == 0 {
+            "在左侧勾选要同步的表".to_string()
+        } else if overridden == 0 {
+            format!("{count} 张表跟随全局游标")
+        } else {
+            format!("{count} 张表 · {overridden} 张使用表级区间")
+        };
+        h_flex()
+            .flex_shrink_0()
+            .items_center()
+            .gap_2()
+            .child(label(text, muted))
+            .into_any_element()
     }
-
-    // ------------------------------------------------------------ 待同步表
 
     fn selected_list(&self, cx: &mut Context<Self>) -> AnyElement {
-        let fg = cx.theme().foreground;
         let muted = cx.theme().muted_foreground;
         let border = cx.theme().border;
         let primary = cx.theme().primary;
         let primary_fg = cx.theme().primary_foreground;
+        let accent = cx.theme().accent;
+        let hover_bg = cx.theme().accent;
+        let danger = cx.theme().danger;
 
-        let mut list = v_flex().gap_1().px_2().pb_2();
-        if self.tables.iter().all(|t| !t.selected) {
-            list = list.child(label("在左侧勾选要同步的表", muted));
+        let planned_of = |name: &str| -> Option<u64> {
+            self.report
+                .as_ref()
+                .and_then(|r| r.tables.iter().find(|t| t.table == name))
+                .map(|t| t.planned_rows)
+        };
+
+        let mut list = v_flex().gap_1();
+
+        if self.selected_count() > 0 {
+            list = list.child(
+                h_flex()
+                    .h(px(18.))
+                    .px_2()
+                    .gap_2()
+                    .items_center()
+                    .text_xs()
+                    .text_color(muted)
+                    .child(div().w(px(3.)))
+                    .child(div().flex_1().child("表 → 目标表"))
+                    .child(div().w(px(112.)).child("游标"))
+                    .child(div().w(px(78.)).text_right().child("计划行数"))
+                    .child(div().w(px(76.))),
+            );
         }
+
+        if self.selected_count() == 0 {
+            list = list.child(
+                v_flex()
+                    .items_center()
+                    .justify_center()
+                    .gap_2()
+                    .py_8()
+                    .rounded_md()
+                    .border_1()
+                    .border_dashed()
+                    .border_color(border)
+                    .child(Icon::new(IconName::Frame).text_color(muted))
+                    .child(div().text_xs().text_color(muted).child("还没有选中任何表"))
+                    .child(
+                        div()
+                            .text_xs()
+                            .text_color(muted)
+                            .child("在左侧勾选要同步的表，再点「预检」"),
+                    ),
+            );
+        }
+
         for (i, row) in self.tables.iter().enumerate().filter(|(_, t)| t.selected) {
             let name = row.name.clone();
             let edit_name = row.name.clone();
@@ -583,51 +888,84 @@ impl RowBridgeApp {
                 .dst_table
                 .clone()
                 .unwrap_or_else(|| row.name.clone());
-            let cursor_text = match row.over.cursor {
-                None => "跟随全局".to_string(),
-                Some(c) => match c {
-                    CursorStart::Full => "全量".into(),
-                    CursorStart::Resume => "续跑".into(),
-                    CursorStart::Custom => format!(
-                        "区间 {} → {}",
+            let (cursor_text, cursor_color) = match row.over.cursor {
+                None => ("跟随全局".to_string(), muted),
+                Some(CursorStart::Full) => ("全量".to_string(), primary_fg),
+                Some(CursorStart::Resume) => ("续跑".to_string(), primary_fg),
+                Some(CursorStart::Custom) => (
+                    format!(
+                        "{} → {}",
                         row.over.start_id.clone().unwrap_or_else(|| "min".into()),
                         row.over.end_id.clone().unwrap_or_else(|| "max".into())
                     ),
-                },
+                    primary_fg,
+                ),
             };
-            let truncate = row.over.truncate == Some(true);
+            let has_override = row.over.cursor.is_some();
 
             let mut item = h_flex()
                 .gap_2()
                 .items_center()
+                .h(px(30.))
                 .px_2()
-                .py_1()
                 .rounded_md()
                 .border_1()
                 .border_color(border)
-                .child(div().flex_1().min_w_0().text_xs().child(format!("{name} → {target}")))
-                .child(badge(
-                    cursor_text,
-                    if row.over.cursor.is_some() {
-                        primary_fg
-                    } else {
-                        muted
-                    },
-                    if row.over.cursor.is_some() {
-                        primary
-                    } else {
-                        border
-                    },
-                ));
-            if truncate {
-                item = item.child(badge("清空目标", primary_fg, cx.theme().danger));
+                .hover(move |s| s.bg(hover_bg))
+                .child(
+                    div()
+                        .w(px(3.))
+                        .h(px(16.))
+                        .rounded_full()
+                        .bg(if has_override { primary } else { accent }),
+                )
+                .child(
+                    h_flex()
+                        .flex_1()
+                        .min_w_0()
+                        .gap_1()
+                        .items_center()
+                        .child(div().text_xs().truncate().child(name.clone()))
+                        .child(Icon::new(IconName::ArrowRight).xsmall().text_color(muted))
+                        .child(
+                            div()
+                                .text_xs()
+                                .text_color(muted)
+                                .truncate()
+                                .child(target.clone()),
+                        ),
+                )
+                .child(
+                    div()
+                        .w(px(112.))
+                        .child(chip(
+                            cursor_text,
+                            cursor_color,
+                            if has_override { primary } else { accent },
+                        )),
+                )
+                .child(
+                    div().w(px(78.)).text_right().child(mono(
+                        match planned_of(&row.name) {
+                            Some(v) => v.to_string(),
+                            None => "-".to_string(),
+                        },
+                        muted,
+                    )),
+                );
+
+            if row.over.truncate == Some(true) {
+                item = item.child(chip("清空目标", danger, accent));
             }
+
             item = item
                 .child(
                     Button::new(format!("edit-{i}"))
                         .xsmall()
                         .ghost()
+                        .icon(IconName::Calendar)
                         .label("区间")
+                        .tooltip("设置本表起止 ID / 目标表名")
                         .on_click(cx.listener(move |this, _: &ClickEvent, window, cx| {
                             this.start_edit(&edit_name, window, cx);
                             cx.notify();
@@ -637,7 +975,8 @@ impl RowBridgeApp {
                     Button::new(format!("rm-{i}"))
                         .xsmall()
                         .ghost()
-                        .label("移除")
+                        .icon(IconName::Close)
+                        .tooltip("从批次中移除")
                         .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
                             this.toggle_table(&remove_name, false);
                             cx.notify();
@@ -646,82 +985,22 @@ impl RowBridgeApp {
             list = list.child(item);
         }
 
-        let mut head = h_flex()
-            .items_center()
-            .justify_between()
-            .px_3()
-            .pt_2()
-            .pb_1()
-            .child(section_title(
-                format!("待同步 {} 张 · 估算 {} 行", self.selected_count(), human_rows(self.estimated_rows())),
-                fg,
-            ));
-
-        let mut actions = h_flex().gap_2().items_center();
-        actions = actions.child(
-            Button::new("do-preflight")
-                .xsmall()
-                .label(if self.preflighting { "预检中…" } else { "预检" })
-                .disabled(!self.can_preflight())
-                .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
-                    this.do_preflight(cx);
-                    cx.notify();
-                })),
-        );
-        if self.running {
-            actions = actions.child(
-                Button::new("do-cancel")
-                    .xsmall()
-                    .danger()
-                    .label("取消同步")
-                    .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
-                        this.do_cancel();
-                        cx.notify();
-                    })),
-            );
-        } else {
-            actions = actions.child(
-                Button::new("do-start")
-                    .xsmall()
-                    .primary()
-                    .label("开始同步")
-                    .disabled(!self.can_start())
-                    .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
-                        this.do_start(cx);
-                        cx.notify();
-                    })),
-            );
-        }
-        head = head.child(actions);
-
-        v_flex()
-            .flex_1()
-            .min_h_0()
-            .border_b_1()
-            .border_color(border)
-            .child(head)
-            .child(
-                div()
-                    .id("selected-scroll")
-                    .flex_1()
-                    .min_h_0()
-                    .overflow_y_scrollbar()
-                    .child(list),
-            )
-            .into_any_element()
+        list.into_any_element()
     }
 
-    // ------------------------------------------------------------ 单表覆盖编辑
-
     fn editor_panel(&self, cx: &mut Context<Self>) -> AnyElement {
-        let Some(name) = self.editing.clone() else {
-            return div().into_any_element();
+        let some_name = match self.editing.clone() {
+            Some(n) => n,
+            None => return div().into_any_element(),
         };
         let fg = cx.theme().foreground;
         let muted = cx.theme().muted_foreground;
-        let border = cx.theme().border;
+        let accent = cx.theme().accent;
 
-        let mut cursor_row = h_flex().gap_1().items_center().child(label("游标", muted));
+        let mut cursor_row = h_flex()
+            .gap_1()
+            .items_center()
+            .child(field_label("本表游标", muted));
         let options: [(Option<CursorStart>, &str); 4] = [
             (None, "跟随全局"),
             (Some(CursorStart::Full), "全量"),
@@ -743,48 +1022,25 @@ impl RowBridgeApp {
             )));
         }
 
-        let show_range = self.ed_cursor == Some(CursorStart::Custom);
-        let apply_label = format!("应用（{name}）");
-
         let mut block = v_flex()
             .flex_shrink_0()
             .gap_2()
-            .p_3()
-            .border_t_1()
-            .border_color(border)
-            .child(section_title(format!("表级覆盖 · {name}"), fg))
-            .child(cursor_row);
-
-        if show_range {
-            block = block.child(
-                h_flex()
-                    .gap_2()
-                    .child(div().flex_1().min_w_0().child(Input::new(&self.ed_start).small()))
-                    .child(div().flex_1().min_w_0().child(Input::new(&self.ed_end).small())),
-            );
-        }
-
-        block = block
+            .p_2()
+            .rounded_md()
+            .bg(accent)
             .child(
                 h_flex()
-                    .gap_2()
                     .items_center()
-                    .child(div().flex_1().min_w_0().child(Input::new(&self.ed_dst_table).small()))
-                    .child(
-                        Button::new("ed-truncate")
-                            .xsmall()
-                            .ghost()
-                            .label(format!("清空目标表：{}", self.ed_truncate.label()))
-                            .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
-                                this.ed_truncate = this.ed_truncate.next();
-                                cx.notify();
-                            })),
-                    ),
-            )
-            .child(
-                h_flex()
                     .gap_2()
-                    .justify_end()
+                    .child(Icon::new(IconName::Calendar).xsmall().text_color(muted))
+                    .child(
+                        div()
+                            .text_xs()
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .text_color(fg)
+                            .child(format!("表级覆盖 · {some_name}")),
+                    )
+                    .child(div().flex_1())
                     .child(
                         Button::new("ed-cancel")
                             .xsmall()
@@ -799,124 +1055,231 @@ impl RowBridgeApp {
                         Button::new("ed-apply")
                             .xsmall()
                             .primary()
-                            .label(apply_label)
+                            .icon(IconName::Check)
+                            .label("应用")
                             .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
                                 this.apply_edit(cx);
                                 cx.notify();
                             })),
                     ),
-            );
+            )
+            .child(cursor_row);
 
-        block.into_any_element()
+        if self.ed_cursor == Some(CursorStart::Custom) {
+            block = block.child(
+                h_flex()
+                    .gap_2()
+                    .items_end()
+                    .child(
+                        v_flex()
+                            .flex_1()
+                            .gap_1()
+                            .child(field_label("起始 ID（含）", muted))
+                            .child(Input::new(&self.ed_start).small()),
+                    )
+                    .child(
+                        v_flex()
+                            .flex_1()
+                            .gap_1()
+                            .child(field_label("结束 ID（含）", muted))
+                            .child(Input::new(&self.ed_end).small()),
+                    ),
+            );
+        }
+
+        block
+            .child(
+                h_flex()
+                    .gap_2()
+                    .items_end()
+                    .child(
+                        v_flex()
+                            .flex_1()
+                            .gap_1()
+                            .child(field_label("目标表名（留空同名）", muted))
+                            .child(Input::new(&self.ed_dst_table).small()),
+                    )
+                    .child(
+                        Button::new("ed-truncate")
+                            .xsmall()
+                            .outline()
+                            .icon(IconName::Delete)
+                            .label(format!("清空目标：{}", self.ed_truncate.label()))
+                            .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
+                                this.ed_truncate = this.ed_truncate.next();
+                                cx.notify();
+                            })),
+                    ),
+            )
+            .into_any_element()
     }
 
-    // ------------------------------------------------------------ 进度与预检
+    // ------------------------------------------------------------ 运行状态
 
-    fn progress_block(&self, cx: &mut Context<Self>) -> AnyElement {
-        let fg = cx.theme().foreground;
-        let muted = cx.theme().muted_foreground;
+    fn progress_card(&self, cx: &mut Context<Self>) -> AnyElement {
         let border = cx.theme().border;
+        let card_bg = cx.theme().title_bar;
+        let muted = cx.theme().muted_foreground;
+        let fg = cx.theme().foreground;
         let danger = cx.theme().danger;
         let warning = cx.theme().warning;
+        let success = cx.theme().success;
 
-        if self.progress.is_empty() && self.report.is_none() && self.logs.is_empty() {
-            return div()
-                .flex_shrink_0()
-                .p_3()
-                .child(label("预检或同步后，这里显示逐表进度与日志。", muted))
-                .into_any_element();
+        let total_done: u64 = self.progress.values().map(|p| p.rows).sum();
+        let planned: u64 = self.progress.values().map(|p| p.planned).sum();
+        let done_tables = self
+            .progress
+            .values()
+            .filter(|p| p.status == "done")
+            .count();
+
+        let mut head = card_head("运行状态", IconName::ChartPie, muted, border);
+        head = head.child(div().flex_1());
+        if !self.progress.is_empty() {
+            head = head
+                .child(chip(
+                    format!("{done_tables}/{} 张完成", self.progress.len()),
+                    muted,
+                    cx.theme().accent,
+                ))
+                .child(chip(
+                    format!("{} / {} 行", total_done, planned),
+                    fg,
+                    cx.theme().accent,
+                ));
         }
 
         let mut list = v_flex().gap_2().p_3();
-        let mut events: Vec<(&String, &TableProgress)> = self.progress.iter().collect();
-        events.sort_by(|a, b| a.0.cmp(b.0));
-        for (name, p) in events {
-            let color = match p.status {
-                "failed" => danger,
-                "done" => cx.theme().success,
-                "running" => cx.theme().primary,
-                _ => muted,
-            };
-            let mut row = v_flex()
-                .gap_1()
-                .child(
-                    h_flex()
-                        .items_center()
-                        .justify_between()
-                        .child(div().text_xs().child(name.clone()))
-                        .child(label(
-                            format!(
-                                "{} · {} / {} 行 · {:.0} 行/s{}",
-                                p.status,
-                                p.rows,
-                                p.planned,
-                                p.rps,
-                                p.cursor
-                                    .is_empty()
-                                    .then(String::new)
-                                    .unwrap_or_else(|| format!(" · {}", p.cursor))
-                            ),
-                            color,
-                        )),
-                )
-                .child(
-                    Progress::new(format!("pg-{name}"))
-                        .value(p.percent())
-                        .color(color),
-                );
-            if let Some(err) = &p.error {
-                row = row.child(label(err.clone(), danger));
-            }
-            list = list.child(row);
+
+        if self.progress.is_empty() && self.report.is_none() && self.logs.is_empty() {
+            list = list.child(
+                h_flex()
+                    .gap_2()
+                    .items_center()
+                    .child(Icon::new(IconName::CircleAlert).xsmall().text_color(muted))
+                    .child(label("预检或同步后，这里显示逐表进度与日志", muted)),
+            );
         }
 
-        // 预检问题
+        let mut rows: Vec<(&String, &TableProgress)> = self.progress.iter().collect();
+        rows.sort_by(|a, b| a.0.cmp(b.0));
+        for (name, p) in rows {
+            let color = match p.status {
+                "failed" => danger,
+                "done" => success,
+                "running" => cx.theme().info,
+                _ => muted,
+            };
+            let status_text = match p.status {
+                "failed" => "失败",
+                "done" => "完成",
+                "running" => "同步中",
+                _ => "待开始",
+            };
+            let track = cx.theme().accent;
+            list = list.child(
+                v_flex()
+                    .gap_1()
+                    .child(
+                        h_flex()
+                            .items_center()
+                            .gap_2()
+                            .child(
+                                div()
+                                    .w(px(140.))
+                                    .text_xs()
+                                    .truncate()
+                                    .child(name.clone()),
+                            )
+                            .child(
+                                div()
+                                    .flex_1()
+                                    .h(px(6.))
+                                    .rounded_full()
+                                    .bg(track)
+                                    .child(
+                                        div()
+                                            .h_full()
+                                            .w(relative(p.percent() / 100.0))
+                                            .rounded_full()
+                                            .bg(color),
+                                    ),
+                            )
+                            .child(
+                                div()
+                                    .w(px(104.))
+                                    .text_right()
+                                    .child(mono(format!("{} / {}", p.rows, p.planned), muted)),
+                            )
+                            .child(chip(status_text, color, track)),
+                    )
+                    .child(
+                        h_flex()
+                            .gap_3()
+                            .pl(px(140.))
+                            .child(mono(format!("{:.0} 行/s", p.rps), muted))
+                            .children(if p.cursor.is_empty() {
+                                None
+                            } else {
+                                Some(mono(format!("游标 {}", p.cursor), muted))
+                            }),
+                    ),
+            );
+            if let Some(err) = &p.error {
+                list = list.child(
+                    h_flex()
+                        .gap_2()
+                        .items_center()
+                        .child(Icon::new(IconName::CircleX).xsmall().text_color(danger))
+                        .child(label(err.clone(), danger)),
+                );
+            }
+        }
+
         if let Some(report) = &self.report {
             for t in &report.tables {
                 for check in &t.checks {
-                    let (color, text) = match check.severity {
-                        Severity::Error => (danger, "错误"),
-                        Severity::Warning => (warning, "警告"),
-                        Severity::Info => (muted, "信息"),
+                    let (color, icon, text) = match check.severity {
+                        Severity::Error => (danger, IconName::CircleX, "错误"),
+                        Severity::Warning => (warning, IconName::TriangleAlert, "警告"),
+                        Severity::Info => (muted, IconName::CircleAlert, "信息"),
                         Severity::Ok => continue,
                     };
-                    list = list.child(label(
-                        format!("[{}] {} · {text}：{}", t.table, check.code, check.message),
-                        color,
-                    ));
+                    list = list.child(
+                        h_flex()
+                            .gap_2()
+                            .items_start()
+                            .child(Icon::new(icon).xsmall().text_color(color))
+                            .child(label(
+                                format!("{} · {text}：{}", t.table, check.message),
+                                color,
+                            )),
+                    );
                 }
             }
         }
 
-        // 最近日志
-        let recent: Vec<_> = self.logs.iter().rev().take(40).collect();
+        let recent: Vec<_> = self.logs.iter().rev().take(20).collect();
         if !recent.is_empty() {
             let mut log_list = v_flex().gap_1();
             for (level, msg) in recent.into_iter().rev() {
-                log_list = log_list.child(label(format!("{level} · {msg}"), muted));
+                let color = match level.as_ref() {
+                    "error" => danger,
+                    "warn" => warning,
+                    _ => muted,
+                };
+                log_list = log_list.child(label(format!("{level} · {msg}"), color));
             }
-            list = list.child(
-                div()
-                    .pt_1()
-                    .border_t_1()
-                    .border_color(border)
-                    .child(log_list),
-            );
+            list = list
+                .child(divider(border))
+                .child(log_list);
         }
 
-        v_flex()
-            .flex_shrink_0()
-            .h(px(230.))
+        panel_card(card_bg, border)
+            .flex_1()
+            .min_h(px(210.))
             .min_h_0()
-            .border_t_1()
-            .border_color(border)
-            .child(
-                div()
-                    .flex_shrink_0()
-                    .px_3()
-                    .pt_2()
-                    .child(section_title("运行进度", fg)),
-            )
+            .child(head)
             .child(
                 div()
                     .id("progress-scroll")
@@ -932,26 +1295,25 @@ impl RowBridgeApp {
         let muted = cx.theme().muted_foreground;
         let danger = cx.theme().danger;
         let success = cx.theme().success;
-        let warning = cx.theme().warning;
 
         let Some(report) = &self.report else {
-            return v_flex()
-                .gap_1()
+            return h_flex()
+                .gap_2()
+                .items_center()
+                .child(Icon::new(IconName::CircleAlert).xsmall().text_color(muted))
                 .child(label("尚未预检", muted))
                 .into_any_element();
         };
 
         let mut block = v_flex().gap_1();
         for t in &report.tables {
-            let (color, text) = if t.syncable {
+            let (color, icon, text) = if t.syncable {
                 (
                     success,
+                    IconName::CircleCheck,
                     format!(
-                        "{} → {} · 预计 {} 行 (源 MAX {})",
-                        t.table,
-                        t.target_table,
-                        t.planned_rows,
-                        t.source_max_pk.clone().unwrap_or_else(|| "-".into())
+                        "{} → {} · 预计 {} 行",
+                        t.table, t.target_table, t.planned_rows
                     ),
                 )
             } else {
@@ -961,12 +1323,23 @@ impl RowBridgeApp {
                     .find(|c| c.severity == Severity::Error)
                     .map(|c| c.message.clone())
                     .unwrap_or_else(|| "不可同步".into());
-                (danger, format!("{} · {reason}", t.table))
+                (danger, IconName::CircleX, format!("{} · {reason}", t.table))
             };
-            block = block.child(label(text, color));
-        }
-        if report.tables.iter().any(|t| !t.syncable) {
-            block = block.child(label("被阻塞的表可以取消勾选后重试", warning));
+            block = block.child(
+                h_flex()
+                    .gap_2()
+                    .items_start()
+                    .child(Icon::new(icon).xsmall().text_color(color))
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .text_xs()
+                            .line_clamp(2)
+                            .text_color(color)
+                            .child(text),
+                    ),
+            );
         }
         let _ = cx;
         block.into_any_element()
