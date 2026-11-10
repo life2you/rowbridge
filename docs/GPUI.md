@@ -4,7 +4,8 @@
 配合 [longbridge/gpui-kit](https://github.com/longbridge/gpui-kit)（原 `gpui-component`）重写界面，
 不再依赖 Node / Vite / WebView。
 
-Tauri 版（`src/` + `src-tauri/`）**完全保留，可继续使用**，两者共用同一个引擎 `crates/rowbridge-core`。
+Tauri 版（`src/` + `src-tauri/`）源码保留，但**已经不再随发布构建**——`release.yml` / `ci.yml`
+现在只出原生版的 `.app` 和 dmg。两者共用同一个引擎 `crates/rowbridge-core`。
 
 ## 为什么可以并存
 
@@ -40,7 +41,7 @@ cargo run -p rowbridge-gpui --release
 ```bash
 ./scripts/bundle-gpui.sh            # release 构建 → dist-gpui/RowBridge.app
 ./scripts/bundle-gpui.sh --debug    # 用现有 debug 二进制，秒出
-./scripts/bundle-gpui.sh --install  # 顺带装到 /Applications/RowBridge Native.app
+./scripts/bundle-gpui.sh --install  # 顺带装到 /Applications/RowBridge.app
 ```
 
 `.app` 与 Tauri 版共用 `src-tauri/icons/icon.icns`，`CFBundleExecutable` 就叫 `RowBridge`，

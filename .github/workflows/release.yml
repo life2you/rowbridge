@@ -24,47 +24,35 @@ jobs:
 
       - uses: dtolnay/rust-toolchain@stable
 
-      - uses: actions/setup-node@v4
-        with:
-          node-version: 20
-
       - name: 版本一致性校验
         run: |
           TAG="${{ inputs.tag || github.ref_name }}"
           VER="${TAG#v}"
           CARGO_VER=$(grep -m1 '^version' Cargo.toml | sed -E 's/.*"(.*)".*/\1/')
-          PKG_VER=$(node -p "require('./package.json').version")
-          CONF_VER=$(node -p "require('./src-tauri/tauri.conf.json').version")
+          PKG_VER=$(python3 -c "import json;print(json.load(open('package.json'))['version'])")
+          CONF_VER=$(python3 -c "import json;print(json.load(open('src-tauri/tauri.conf.json'))['version'])")
           echo "tag=$TAG  cargo=$CARGO_VER  package=$PKG_VER  tauri=$CONF_VER"
           for v in "$CARGO_VER" "$PKG_VER" "$CONF_VER"; do
             [ "$v" = "$VER" ] || { echo "::error::版本不一致：$v != $VER"; exit 1; }
           done
 
-      - name: 安装依赖
-        run: npm ci
-
       - name: 测试
         run: cargo test -p rowbridge-core --all-targets
 
-      - name: 构建应用
-        run: npm run tauri build -- --no-bundle
+      # 发布的是原生的 GPUI 界面（crates/rowbridge-gpui），不再构建 Tauri/WebView 版本。
+      - name: 构建原生应用
+        run: ./scripts/bundle-gpui.sh --release
 
       - name: 生成 dmg
         run: |
           VER="${GITHUB_REF_NAME#v}"
           [ -n "${{ inputs.tag }}" ] && VER="${{ inputs.tag }}"
           VER="${VER#v}"
-          APP=target/release/bundle/macos/RowBridge.app
-          mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
-          cp target/release/rowbridge "$APP/Contents/MacOS/rowbridge"
-          cp src-tauri/icons/icon.icns "$APP/Contents/Resources/icon.icns"
-          cp src-tauri/Info.plist "$APP/Contents/Info.plist" 2>/dev/null || true
-          # 静态 Info.plist 里写的版本号会过期，打包时统一改成这次要发的版本
-          /usr/libexec/PlistBuddy -c "Set :CFBundleShortVersionString $VER" "$APP/Contents/Info.plist"
-          /usr/libexec/PlistBuddy -c "Set :CFBundleVersion $VER" "$APP/Contents/Info.plist"
-          /usr/libexec/PlistBuddy -c "Set :CFBundleExecutable rowbridge" "$APP/Contents/Info.plist"
-          echo "打包版本：$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' "$APP/Contents/Info.plist")"
-          codesign --force --deep --sign - "$APP"
+          APP=dist-gpui/RowBridge.app
+          # bundle-gpui.sh 的版本取自 Cargo.toml，这里再核对一次，防止发错版本
+          APP_VER=$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' "$APP/Contents/Info.plist")
+          echo "app 版本：$APP_VER（期望 $VER）"
+          [ "$APP_VER" = "$VER" ] || { echo "::error::app 版本与 tag 不一致"; exit 1; }
           STAGE=$(mktemp -d)
           cp -R "$APP" "$STAGE/"
           ln -s /Applications "$STAGE/Applications"

@@ -8,7 +8,7 @@
 # 用法：
 #   ./scripts/bundle-gpui.sh              # release 构建并打包到 dist-gpui/
 #   ./scripts/bundle-gpui.sh --debug      # 用已有的 debug 二进制，打得快
-#   ./scripts/bundle-gpui.sh --install    # 额外装到 /Applications/RowBridge Native.app
+#   ./scripts/bundle-gpui.sh --install    # 同时装到 /Applications/RowBridge.app
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -86,10 +86,9 @@ echo "==> ad-hoc 签名"
 codesign --force --deep --sign - "$APP" >/dev/null 2>&1 || echo "   （签名失败，忽略）"
 
 if [[ "$INSTALL" == "1" ]]; then
-  # 不叫 RowBridge.app：/Applications/RowBridge.app 是 Homebrew cask 管的发布版，
-  # 覆盖它会让 brew 的版本记录和实际内容对不上。原生版单独放一个名字并排装。
-  DEST="/Applications/RowBridge Native.app"
-  echo "==> 复制到 $DEST"
+  DEST="/Applications/RowBridge.app"
+  echo "==> 安装到 $DEST"
+  # 之前由 Homebrew cask 装的 Tauri 版同名目录如果还在，直接覆盖掉。
   rm -rf "$DEST"
   cp -R "$APP" "$DEST"
   echo "已安装 $DEST"

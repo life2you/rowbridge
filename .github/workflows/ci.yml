@@ -13,17 +13,8 @@ jobs:
 
       - uses: dtolnay/rust-toolchain@stable
 
-      - uses: actions/setup-node@v4
-        with:
-          node-version: 20
-
       - name: 单元测试
         run: cargo test -p rowbridge-core --lib
-
-      - name: 前端类型检查与构建
-        run: |
-          npm ci
-          npm run build
 
       # GitHub 的 macOS runner 没有 Docker，端到端测试跑不了。
       # 它在本地和自托管环境上跑：./tests/e2e/run.sh
@@ -38,33 +29,14 @@ jobs:
 
       - uses: dtolnay/rust-toolchain@stable
 
-      - uses: actions/setup-node@v4
-        with:
-          node-version: 20
+      # 发布物是原生 GPUI 应用（crates/rowbridge-gpui），Tauri 版源码保留但不再构建。
+      - name: 构建原生应用
+        run: ./scripts/bundle-gpui.sh --release
 
-      - name: 安装依赖
-        run: npm ci
-
-      - name: 构建应用（不打包 dmg，CI 里无 GUI 会卡在 Finder AppleScript）
-        run: npm run tauri build -- --no-bundle
-
-      # --no-bundle 只产出二进制，不生成 .app；这里手工组装
-      - name: 手动生成 dmg
-        run: |
-          APP=target/release/bundle/macos/RowBridge.app
-          mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
-          cp target/release/rowbridge "$APP/Contents/MacOS/rowbridge"
-          cp src-tauri/icons/icon.icns "$APP/Contents/Resources/icon.icns"
-          cp src-tauri/Info.plist "$APP/Contents/Info.plist"
-          codesign --force --deep --sign - "$APP"
-          STAGE=$(mktemp -d)
-          cp -R "$APP" "$STAGE/"
-          ln -s /Applications "$STAGE/Applications"
-          hdiutil create -volname RowBridge -srcfolder "$STAGE" -ov -format UDZO \
-            target/release/RowBridge_aarch64.dmg
-          rm -rf "$STAGE"
+      - name: 打包 zip
+        run: ditto -c -k --keepParent dist-gpui/RowBridge.app dist-gpui/RowBridge.zip
 
       - uses: actions/upload-artifact@v4
         with:
-          name: RowBridge-dmg
-          path: target/release/RowBridge_*.dmg
+          name: RowBridge-app
+          path: dist-gpui/RowBridge.zip

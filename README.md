@@ -153,33 +153,21 @@ xattr -cr /Applications/RowBridge.app
 
 ## 开发
 
-需要 Node 20+、Rust 1.88+、Xcode Command Line Tools。
+需要 Rust 1.88+、Xcode Command Line Tools（不再需要 Node，界面是原生的）。
 
 ```bash
-npm install
-npm run tauri dev
+# 调试运行
+cargo run -p rowbridge-gpui
+
+# 打成 .app（Dock 图标和名称正常），产物在 dist-gpui/RowBridge.app
+./scripts/bundle-gpui.sh --release
+./scripts/bundle-gpui.sh --release --install   # 顺带装到 /Applications/RowBridge.app
 ```
 
-打包 dmg：
-
-```bash
-npm run tauri build
-# 产物在 src-tauri/target/release/bundle/dmg/
-```
-
-### 原生 GPUI 界面（实验）
-
-除了 Tauri + React 界面，仓库里还有一份用 Rust + GPUI（gpui-kit）写的原生界面，不含 WebView：
-
-```bash
-cargo run -p rowbridge-gpui --release
-
-# 想要 Dock 图标和名称正常（而不是一个命令行进程），打成 .app：
-./scripts/bundle-gpui.sh
-```
-
-它复用同一个引擎和同一份 `~/.RowBridge/connections.json`，与 Tauri 版可并存。
+界面用 Rust + GPUI（gpui-kit）写，不含 WebView；`release.yml` 发的也是这个原生版本。
 详见 [docs/GPUI.md](docs/GPUI.md)。
+
+`src-tauri/` 是早期的 Tauri + React 界面，源码保留但已不再随发布构建。
 
 ### 引擎可以脱离 UI 单独跑
 
