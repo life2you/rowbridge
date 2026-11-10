@@ -173,6 +173,9 @@ npm run tauri build
 
 ```bash
 cargo run -p rowbridge-gpui --release
+
+# 想要 Dock 图标和名称正常（而不是一个命令行进程），打成 .app：
+./scripts/bundle-gpui.sh
 ```
 
 它复用同一个引擎和同一份 `~/.RowBridge/connections.json`，与 Tauri 版可并存。

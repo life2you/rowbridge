@@ -31,6 +31,21 @@ cargo run -p rowbridge-gpui --release
 首次启动会读取 `~/.RowBridge/connections.json`，也就是 Tauri 版保存的同一批数据源，
 两个界面可以共用，互不影响。
 
+### 打成 .app（Dock 图标 / 名称正常）
+
+`cargo run` 直接跑二进制时，Dock 里显示的是可执行文件的默认图标。要么在主线程里用
+`NSApplication.setApplicationIconImage` 现设一张（`src/main.rs` 的 `install_dock_icon`，已验证），
+要么直接打包成标准 .app：
+
+```bash
+./scripts/bundle-gpui.sh            # release 构建 → dist-gpui/RowBridge.app
+./scripts/bundle-gpui.sh --debug    # 用现有 debug 二进制，秒出
+./scripts/bundle-gpui.sh --install  # 顺带复制到 /Applications
+```
+
+`.app` 与 Tauri 版共用 `src-tauri/icons/icon.icns`，`CFBundleExecutable` 就叫 `RowBridge`，
+所以 Dock、Cmd-Tab、菜单栏显示的都是 RowBridge。
+
 ## 功能对齐
 
 | 能力 | 状态 |
@@ -49,7 +64,7 @@ cargo run -p rowbridge-gpui --release
 
 | 文件 | 职责 |
 |---|---|
-| `src/main.rs` | 初始化 GPUI、深色主题、打开主窗口 |
+| `src/main.rs` | 初始化 GPUI、深色主题、Dock 图标、打开主窗口 |
 | `src/model.rs` | 纯 UI 数据：连接面板、选项面板、表行、进度、`DbSide` / `CursorMode` / `Tri` |
 | `src/app.rs` | `RowBridgeApp` 状态机与动作：连库、拉表、预检、结构同步、开始/取消同步、事件归并 |
 | `src/ops.rs` | Tokio 运行时桥接：所有 MySQL 调用都在这里，结果用 oneshot 送回 UI 任务 |

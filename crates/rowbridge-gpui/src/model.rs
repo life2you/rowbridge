@@ -1,9 +1,12 @@
 //! UI 数据模型：连接面板、选项面板、表行、运行进度。
 
+use std::collections::HashMap;
+
 use gpui_kit::component::input::InputState;
 use gpui_kit::*;
 use rowbridge_core::config::{ConnConfig, CursorStart};
 use rowbridge_core::connections::SavedConnection;
+use tokio_util::sync::CancellationToken;
 
 /// 哪一侧的数据库（源 / 目标）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -37,6 +40,7 @@ impl CursorMode {
             CursorMode::Custom => "自定义",
         }
     }
+    #[allow(dead_code)]
     pub fn to_core(self) -> CursorStart {
         match self {
             CursorMode::Full => CursorStart::Full,
@@ -55,6 +59,7 @@ pub enum Tri {
 }
 
 impl Tri {
+    #[allow(dead_code)]
     pub fn label(self) -> &'static str {
         match self {
             Tri::Follow => "跟随",
@@ -99,14 +104,13 @@ pub struct ConnPanel {
     /// (是否成功, 文案)
     pub note: Option<(bool, SharedString)>,
     pub busy: bool,
+    /// 连接表单是否折叠（连接成功后可折叠以释放垂直空间给库表列表）
+    #[allow(dead_code)]
+    pub collapsed: bool,
 }
 
 impl ConnPanel {
-    pub fn new(
-        title_placeholder: &'static str,
-        window: &mut Window,
-        cx: &mut App,
-    ) -> Self {
+    pub fn new(title_placeholder: &'static str, window: &mut Window, cx: &mut App) -> Self {
         let host = cx.new(|cx| {
             InputState::new(window, cx)
                 .placeholder("主机，例如 127.0.0.1")
@@ -133,6 +137,7 @@ impl ConnPanel {
             label: None,
             note: None,
             busy: false,
+            collapsed: false,
         }
     }
 
@@ -179,6 +184,7 @@ impl ConnPanel {
         set_input(&self.password, c.password.clone(), window, cx);
     }
 
+    #[allow(dead_code)]
     pub fn display_name(&self, cx: &App) -> SharedString {
         match &self.label {
             Some(l) => l.clone(),
@@ -226,10 +232,21 @@ pub struct OptionsPanel {
 
 impl OptionsPanel {
     pub fn new(window: &mut Window, cx: &mut impl AppContext) -> Self {
-        let parallelism = cx.new(|cx| InputState::new(window, cx).placeholder("并发").default_value("2"));
-        let batch_size = cx.new(|cx| InputState::new(window, cx).placeholder("批大小").default_value("1000"));
-        let max_batch_size =
-            cx.new(|cx| InputState::new(window, cx).placeholder("批大小上限").default_value("10000"));
+        let parallelism = cx.new(|cx| {
+            InputState::new(window, cx)
+                .placeholder("并发")
+                .default_value("2")
+        });
+        let batch_size = cx.new(|cx| {
+            InputState::new(window, cx)
+                .placeholder("批大小")
+                .default_value("1000")
+        });
+        let max_batch_size = cx.new(|cx| {
+            InputState::new(window, cx)
+                .placeholder("批大小上限")
+                .default_value("10000")
+        });
         let global_start = cx.new(|cx| InputState::new(window, cx).placeholder("起始 ID"));
         let global_end = cx.new(|cx| InputState::new(window, cx).placeholder("结束 ID"));
         Self {
@@ -285,7 +302,29 @@ pub struct TableOverride {
     pub cursor: Option<CursorStart>,
     pub start_id: Option<String>,
     pub end_id: Option<String>,
+    pub filter: Option<String>,
     pub truncate: Option<bool>,
+    pub create_table: Option<bool>,
+    pub strip_foreign_keys: Option<bool>,
+    pub strip_auto_increment: Option<bool>,
+    pub map_collation: Option<bool>,
+    pub continue_on_error: Option<bool>,
+}
+
+impl TableOverride {
+    #[allow(dead_code)]
+    pub fn has_any(&self) -> bool {
+        matches!(self.cursor, Some(CursorStart::Resume | CursorStart::Custom))
+            || self.start_id.is_some()
+            || self.end_id.is_some()
+            || self.filter.is_some()
+            || self.truncate.is_some()
+            || self.create_table.is_some()
+            || self.strip_foreign_keys.is_some()
+            || self.strip_auto_increment.is_some()
+            || self.map_collation.is_some()
+            || self.continue_on_error.is_some()
+    }
 }
 
 /// 表清单里的一行。
@@ -294,9 +333,18 @@ pub struct TableRow {
     pub name: String,
     pub rows_estimate: u64,
     pub primary_key: Option<String>,
+    pub source_max_pk: Option<String>,
     pub unsupported: Option<String>,
     pub selected: bool,
     pub over: TableOverride,
+}
+
+/// 运行日志项。
+#[derive(Debug, Clone)]
+pub struct LogEntry {
+    pub time: SharedString,
+    pub level: SharedString,
+    pub message: SharedString,
 }
 
 /// 引擎事件的 UI 视图。
@@ -338,8 +386,107 @@ impl TableProgress {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Tab {
     Sync,
+    Active,
     Sources,
     Log,
+}
+
+/// 任务状态。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TaskStatus {
+    Running,
+    Paused,
+    Completed,
+    Cancelled,
+    Failed,
+}
+
+impl TaskStatus {
+    pub fn is_active(&self) -> bool {
+        matches!(self, TaskStatus::Running | TaskStatus::Paused)
+    }
+
+    #[allow(dead_code)]
+    pub fn label(&self) -> &'static str {
+        match self {
+            TaskStatus::Running => "运行中",
+            TaskStatus::Paused => "已暂停",
+            TaskStatus::Completed => "已完成",
+            TaskStatus::Cancelled => "已取消",
+            TaskStatus::Failed => "失败",
+        }
+    }
+}
+
+/// 任务日志项。
+#[derive(Debug, Clone)]
+pub struct TaskLogEntry {
+    pub time: SharedString,
+    pub level: SharedString,
+    #[allow(dead_code)]
+    pub table: Option<String>,
+    pub message: SharedString,
+}
+
+/// 同步任务对象。
+#[derive(Clone)]
+pub struct SyncTask {
+    pub id: String,
+    pub name: String,
+    pub created_at: String,
+    /// 源数据源展示名（如「生产只读」）
+    pub src_name: String,
+    /// 目标数据源展示名
+    pub dst_name: String,
+    /// 源实例 host:port
+    pub src_ep: String,
+    /// 目标实例 host:port
+    pub dst_ep: String,
+    pub src_schema: String,
+    pub dst_schema: String,
+    pub tables: Vec<String>,
+    pub status: TaskStatus,
+    pub cancel: CancellationToken,
+    pub pause: rowbridge_core::engine::PauseController,
+    pub progress: HashMap<String, TableProgress>,
+    pub logs: Vec<TaskLogEntry>,
+    pub error: Option<String>,
+}
+
+impl SyncTask {
+    pub fn total_done(&self) -> u64 {
+        self.progress.values().map(|p| p.rows).sum()
+    }
+
+    pub fn total_planned(&self) -> u64 {
+        self.progress.values().map(|p| p.planned).sum()
+    }
+
+    pub fn done_tables_count(&self) -> usize {
+        self.progress
+            .values()
+            .filter(|p| p.status == "done")
+            .count()
+    }
+
+    pub fn is_active(&self) -> bool {
+        self.status.is_active()
+    }
+
+    /// 数据源摘要：`生产只读 → AI服务5.7`。
+    pub fn routes(&self) -> String {
+        format!("{} → {}", self.src_name, self.dst_name)
+    }
+
+    /// 表摘要：`accounts 等 3 张表` / `accounts, users`。
+    pub fn tables_summary(&self) -> String {
+        match self.tables.len() {
+            0 => "无表".to_string(),
+            1 => self.tables[0].clone(),
+            2 => self.tables.join(", "),
+            n => format!("{} 等 {} 张表", self.tables[0], n),
+        }
+    }
 }
 
 /// 人类可读的行数。

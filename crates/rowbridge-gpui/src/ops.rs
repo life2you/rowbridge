@@ -7,8 +7,10 @@ use std::future::Future;
 use std::sync::OnceLock;
 
 use rowbridge_core::config::{ConnConfig, TaskConfig};
-use rowbridge_core::engine::{self, Event, EventSink, SchemaSyncReport, TaskReport};
-use rowbridge_core::introspect::{self, SchemaInfo};
+use rowbridge_core::engine::{
+    self, Event, EventSink, PauseController, SchemaSyncReport, TaskReport,
+};
+use rowbridge_core::introspect::{self, ColumnInfo, SchemaInfo};
 use rowbridge_core::preflight::{self, PreflightReport};
 use tokio::sync::{mpsc, oneshot};
 use tokio_util::sync::CancellationToken;
@@ -46,6 +48,7 @@ pub async fn connect(cfg: &ConnConfig) -> Result<mysql_async::Conn, String> {
         .map_err(|e| format!("连接失败: {e}"))
 }
 
+#[allow(dead_code)]
 pub async fn test_connection(cfg: ConnConfig) -> Result<String, String> {
     let mut conn = connect(&cfg).await?;
     let v = introspect::server_version(&mut conn)
@@ -95,7 +98,8 @@ async fn list_tables_inner(
         .await
         .map_err(|e| e.to_string())?;
 
-    let mut pk_map: std::collections::HashMap<String, Vec<String>> = std::collections::HashMap::new();
+    let mut pk_map: std::collections::HashMap<String, Vec<String>> =
+        std::collections::HashMap::new();
     for (table, col, _seq, _non_unique) in pk_rows {
         pk_map.entry(table).or_default().push(col);
     }
@@ -129,6 +133,19 @@ async fn list_tables_inner(
         .collect())
 }
 
+pub async fn list_table_columns(
+    cfg: ConnConfig,
+    schema: String,
+    table: String,
+) -> Result<Vec<ColumnInfo>, String> {
+    let mut conn = connect(&cfg).await?;
+    let detail = introspect::table_detail(&mut conn, &schema, &table)
+        .await
+        .map_err(|e| e.to_string())?;
+    let _ = conn.disconnect().await;
+    Ok(detail.columns)
+}
+
 pub async fn run_preflight(cfg: TaskConfig) -> Result<PreflightReport, String> {
     let same = preflight::same_instance(&cfg.source, &cfg.target);
     let mut sc = connect(&cfg.source)
@@ -158,21 +175,30 @@ pub async fn run_sync_schema(
 pub struct RunHandle {
     /// 引擎事件流
     pub events: mpsc::UnboundedReceiver<Event>,
-    /// 取消令牌
+    /// 取消令牌（与任务自身的 cancel 同源，界面侧按需取用）
+    #[allow(dead_code)]
     pub cancel: CancellationToken,
+    /// 暂停控制器
+    #[allow(dead_code)]
+    pub pause: PauseController,
     /// 任务最终结果（事件流结束后才就绪）
     pub done: oneshot::Receiver<Result<TaskReport, String>>,
 }
 
-pub fn start_sync(cfg: TaskConfig, report: PreflightReport) -> RunHandle {
+pub fn start_sync(
+    cfg: TaskConfig,
+    report: PreflightReport,
+    cancel: CancellationToken,
+    pause: PauseController,
+) -> RunHandle {
     let (tx, rx) = mpsc::unbounded_channel();
     let sink = EventSink::new(tx);
-    let cancel = CancellationToken::new();
     let token = cancel.clone();
+    let pause_token = pause.clone();
     let (dtx, drx) = oneshot::channel();
 
     rt().spawn(async move {
-        let result = engine::run_task(cfg, &report, sink, token)
+        let result = engine::run_task(cfg, &report, sink, token, pause_token)
             .await
             .map_err(|e| e.to_string());
         let _ = dtx.send(result);
@@ -181,6 +207,7 @@ pub fn start_sync(cfg: TaskConfig, report: PreflightReport) -> RunHandle {
     RunHandle {
         events: rx,
         cancel,
+        pause,
         done: drx,
     }
 }

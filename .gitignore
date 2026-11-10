@@ -6,6 +6,10 @@
 node_modules
 dist
 dist-ssr
+
+# 打包产物
+dist-gpui
+dist-release
 *.local
 
 # macOS
