@@ -14,6 +14,7 @@ impl Render for RowBridgeApp {
         if !self.smoke_done {
             self.smoke_done = true;
             self.maybe_run_smoke(window, cx);
+            self.maybe_run_dst_smoke(window, cx);
         }
         let bg = cx.theme().background;
         let fg = cx.theme().foreground;

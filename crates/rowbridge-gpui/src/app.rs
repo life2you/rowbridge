@@ -22,8 +22,15 @@ pub struct RowBridgeApp {
     pub(crate) saved: Vec<SavedConnection>,
     pub(crate) src_schemas: Vec<SchemaInfo>,
     pub(crate) dst_schemas: Vec<SchemaInfo>,
+    /// 目标库列表是否已经从目标实例拉取过（区分「还没拉」和「真的一个库都没有」）
+    pub(crate) dst_schemas_loaded: bool,
     pub(crate) src_schema: Option<String>,
     pub(crate) dst_schema: Option<String>,
+    /// 目标端「应该」用的库名：默认跟源库同名。目标端还没这个库时
+    /// `dst_schema` 保持 None（下拉框显示为空），这里记住待创建的库名。
+    pub(crate) dst_schema_wanted: Option<String>,
+    /// 预检通过后自动开始，用于「目标库不存在 → 确认创建 → 预检 → 开始」链路
+    pub(crate) start_after_preflight: bool,
     pub(crate) tables: Vec<TableRow>,
     pub(crate) loading_tables: bool,
 
@@ -144,8 +151,11 @@ impl RowBridgeApp {
             saved,
             src_schemas: Vec::new(),
             dst_schemas: Vec::new(),
+            dst_schemas_loaded: false,
             src_schema: None,
             dst_schema: None,
+            dst_schema_wanted: None,
+            start_after_preflight: false,
             tables: Vec::new(),
             loading_tables: false,
             editing: None,
@@ -324,6 +334,191 @@ impl RowBridgeApp {
         .detach();
     }
 
+    /// 自检：`RB_GPUI_SMOKE_DST=1` 时验证「目标库跟随源库同名 / 缺库留空 / 库名不同告警」。
+    /// 全程只读：不建库、不写数据。
+    pub(crate) fn maybe_run_dst_smoke(&self, window: &mut Window, cx: &mut Context<Self>) {
+        let mode = std::env::var("RB_GPUI_SMOKE_DST").unwrap_or_default();
+        if !matches!(mode.as_str(), "1" | "2" | "3") {
+            return;
+        }
+        cx.spawn_in(window, async move |this, cx| {
+            macro_rules! dump {
+                ($tag:expr) => {{
+                    let info = this
+                        .update(cx, |this, _| {
+                            (
+                                this.src_schema.clone(),
+                                this.dst_schema.clone(),
+                                this.dst_schema_wanted.clone(),
+                                this.missing_target_schema(),
+                                this.schema_names_differ(),
+                                this.dst_schemas.len(),
+                            )
+                        })
+                        .unwrap_or_default();
+                    eprintln!(
+                        "[dst-smoke] {} | 源库={:?} 目标库={:?} 目标端待建={:?} 缺库={:?} 库名不同={} 目标端库数={}",
+                        $tag, info.0, info.1, info.2, info.3, info.4, info.5
+                    );
+                }};
+            }
+
+            let saved = this.update(cx, |this, _| this.saved.clone()).unwrap_or_default();
+            if saved.len() < 2 {
+                eprintln!("[dst-smoke] 需要至少两个已保存数据源，退出");
+                return;
+            }
+            let (src_conn, dst_conn) = (saved[0].clone(), saved[1].clone());
+            eprintln!(
+                "[dst-smoke] 源数据源 {} / 目标数据源 {}",
+                src_conn.name, dst_conn.name
+            );
+            let _ = this.update_in(cx, |this, window, cx| {
+                this.pick_saved(DbSide::Src, &src_conn.id, window, cx);
+                this.pick_saved(DbSide::Dst, &dst_conn.id, window, cx);
+            });
+            cx.background_executor()
+                .timer(std::time::Duration::from_millis(3500))
+                .await;
+            dump!("① 选好两侧数据源后");
+
+            // ② 选一个目标端没有的源库：目标库应为空，并记为待创建
+            let missing = this
+                .update(cx, |this, _| {
+                    this.src_schemas
+                        .iter()
+                        .map(|s| s.name.clone())
+                        .find(|n| !this.dst_schemas.iter().any(|d| &d.name == n))
+                })
+                .ok()
+                .flatten();
+            if let Some(name) = missing {
+                eprintln!("[dst-smoke] 选一个目标端没有的源库：{name}");
+                let _ = this.update(cx, |this, cx| this.choose_schema(DbSide::Src, &name, cx));
+                cx.background_executor()
+                    .timer(std::time::Duration::from_millis(4000))
+                    .await;
+                dump!("② 源库在目标端不存在");
+            } else {
+                eprintln!("[dst-smoke] 所有源库在目标端都存在，跳过②");
+            }
+
+            // ②s 停在「目标库待创建」这一步，交给人点「加入任务并开始」（RB_GPUI_SMOKE_DST=3）
+            if std::env::var("RB_GPUI_SMOKE_DST").ok().as_deref() == Some("3") {
+                let _ = this.update(cx, |this, cx| {
+                    let pick = this
+                        .tables
+                        .iter()
+                        .filter(|t| t.unsupported.is_none())
+                        .min_by_key(|t| t.rows_estimate)
+                        .map(|t| (t.name.clone(), t.rows_estimate));
+                    if let Some((name, est)) = pick {
+                        this.toggle_table(&name, true);
+                        if let Some(row) = this.tables.iter_mut().find(|t| t.name == name) {
+                            row.over.cursor = Some(CursorStart::Custom);
+                            row.over.start_id = Some("0".into());
+                            row.over.end_id = Some("20".into());
+                        }
+                        eprintln!("[dst-smoke] 已勾选 {name}（估算 {est} 行，区间 0..20），等待人工点开始");
+                    }
+                    this.invalidate_report();
+                    cx.notify();
+                });
+                return;
+            }
+
+            // ②b 完整链路：确认建库 → 预检 → 自动开始（RB_GPUI_SMOKE_DST=2）
+            if std::env::var("RB_GPUI_SMOKE_DST").ok().as_deref() == Some("2") {
+                let ready = this
+                    .update(cx, |this, cx| {
+                        let target = this.missing_target_schema()?;
+                        // 挑行数最少的一张可同步表，并把区间压到 20 行，避免写太多
+                        let pick = this
+                            .tables
+                            .iter()
+                            .filter(|t| t.unsupported.is_none())
+                            .min_by_key(|t| t.rows_estimate)
+                            .map(|t| (t.name.clone(), t.rows_estimate))?;
+                        let (name, est) = pick;
+                        this.toggle_table(&name, true);
+                        if let Some(row) = this.tables.iter_mut().find(|t| t.name == name) {
+                            row.over.cursor = Some(CursorStart::Custom);
+                            row.over.start_id = Some("0".into());
+                            row.over.end_id = Some("20".into());
+                        }
+                        eprintln!("[dst-smoke] 勾选表 {name}（估算 {est} 行，区间 0..20）");
+                        this.invalidate_report();
+                        eprintln!("[dst-smoke] 缺库={:?}，走「确认创建并开始」", target);
+                        this.create_target_db_and_start(target, cx);
+                        Some(name)
+                    })
+                    .ok()
+                    .flatten();
+                if ready.is_some() {
+                    for _ in 0..20 {
+                        cx.background_executor()
+                            .timer(std::time::Duration::from_millis(1000))
+                            .await;
+                        let done = this
+                            .update(cx, |this, _| {
+                                let running = this.preflighting
+                                    || this.tasks.iter().any(|t| t.is_active());
+                                let task = this.tasks.first().map(|t| {
+                                    format!("{:?} {}/{} 行 日志{}条", t.status, t.total_done(), t.total_planned(), t.logs.len())
+                                });
+                                let has_db = this
+                                    .dst_schemas
+                                    .iter()
+                                    .any(|s| Some(&s.name) == this.dst_schema.as_ref());
+                                (running, task, has_db)
+                            })
+                            .unwrap_or((false, None, false));
+                        eprintln!(
+                            "[dst-smoke]   进行中={} 任务={:?} 目标库已出现在列表={}",
+                            done.0, done.1, done.2
+                        );
+                        if !done.0 {
+                            break;
+                        }
+                    }
+                    dump!("②b 建库+同步之后");
+                }
+            }
+
+            // ③ 手动挑一个和目标库不同名的目标库：只告警，不阻断
+            let other = this
+                .update(cx, |this, _| {
+                    let src = this.src_schema.clone().unwrap_or_default();
+                    this.dst_schemas
+                        .iter()
+                        .map(|s| s.name.clone())
+                        .find(|n| *n != src)
+                        .unwrap_or_default()
+                })
+                .unwrap_or_default();
+            if !other.is_empty() {
+                eprintln!("[dst-smoke] 手动把目标库改成 {other}");
+                let _ = this.update(cx, |this, cx| this.choose_schema(DbSide::Dst, &other, cx));
+                dump!("③ 手动选不同名目标库");
+            }
+
+            // ④ 源库再切一次：目标库应重新跟随同名
+            let again = this
+                .update(cx, |this, _| this.src_schemas.first().map(|s| s.name.clone()))
+                .ok()
+                .flatten();
+            if let Some(name) = again {
+                let _ = this.update(cx, |this, cx| this.choose_schema(DbSide::Src, &name, cx));
+                cx.background_executor()
+                    .timer(std::time::Duration::from_millis(1500))
+                    .await;
+                dump!("④ 再切源库后重新对齐");
+            }
+            eprintln!("[dst-smoke] 结束");
+        })
+        .detach();
+    }
+
     // ------------------------------------------------------------ 基础访问
 
     pub(crate) fn panel(&self, side: DbSide) -> &ConnPanel {
@@ -374,11 +569,42 @@ impl RowBridgeApp {
     }
 
     pub(crate) fn can_start(&self) -> bool {
-        match &self.report {
-            Some(r) => {
-                !r.any_blocking_error() && r.tables.iter().any(|t| t.syncable) && !self.preflighting
-            }
+        if self.preflighting {
+            return false;
+        }
+        if let Some(r) = &self.report {
+            return !r.any_blocking_error() && r.tables.iter().any(|t| t.syncable);
+        }
+        // 目标库还没建：允许点「加入任务并开始」，点了会先问要不要建库，再自动预检 + 开始。
+        self.missing_target_schema().is_some() && self.selected_count() > 0
+    }
+
+    /// 目标下拉里已经加载出来的库名。
+    pub(crate) fn dst_schema_exists(&self) -> bool {
+        match self.dst_schema.as_deref() {
+            Some(name) => self.dst_schemas.iter().any(|s| s.name == name),
             None => false,
+        }
+    }
+
+    /// 目标端缺少的库名（只有目标库列表已经拉到时才判断，避免误报）。
+    pub(crate) fn missing_target_schema(&self) -> Option<String> {
+        if !self.dst_schemas_loaded || self.src_schema.is_none() {
+            return None;
+        }
+        if self.dst_schema_exists() {
+            return None;
+        }
+        self.dst_schema
+            .clone()
+            .or_else(|| self.dst_schema_wanted.clone())
+    }
+
+    /// 源库与目标库名字不同（不阻断，但要提示）。
+    pub(crate) fn schema_names_differ(&self) -> bool {
+        match (&self.src_schema, &self.dst_schema) {
+            (Some(a), Some(b)) => a != b,
+            _ => false,
         }
     }
 
@@ -622,10 +848,19 @@ impl RowBridgeApp {
             return;
         };
         self.panel_mut(side).apply_saved(&conn, window, cx);
-        if let Some(schema) = conn.last_schema.clone() {
-            match side {
-                DbSide::Src => self.src_schema = Some(schema),
-                DbSide::Dst => self.dst_schema = Some(schema),
+        match side {
+            // 换了目标数据源：目标库列表稍后会重新加载，先清掉旧的目标库选择
+            DbSide::Dst => {
+                self.dst_schemas.clear();
+                self.dst_schemas_loaded = false;
+                self.dst_schema = None;
+                self.dst_schema_wanted = None;
+            }
+            // 换了源数据源：库列表与表清单作废，库名沿用该数据源上次用的（没有就等列表回来再定）
+            DbSide::Src => {
+                self.src_schemas.clear();
+                self.tables.clear();
+                self.src_schema = conn.last_schema.clone();
             }
         }
         self.invalidate_report();
@@ -738,7 +973,17 @@ impl RowBridgeApp {
         .detach();
     }
 
+    /// 拉库列表；`auto_pick` 为真时顺带做「目标库跟源库同名」的对齐。
     pub(crate) fn load_schemas(&mut self, side: DbSide, cx: &mut Context<Self>) {
+        self.load_schemas_inner(side, true, cx);
+    }
+
+    /// 只刷新列表，不改变当前选择。
+    pub(crate) fn refresh_schemas(&mut self, side: DbSide, cx: &mut Context<Self>) {
+        self.load_schemas_inner(side, false, cx);
+    }
+
+    fn load_schemas_inner(&mut self, side: DbSide, auto_pick: bool, cx: &mut Context<Self>) {
         let cfg = self.panel(side).conn_config(cx);
         self.panel_mut(side).busy = true;
         let rx = ops::spawn(ops::list_schemas(cfg));
@@ -751,11 +996,16 @@ impl RowBridgeApp {
                         let count = list.len();
                         match side {
                             DbSide::Src => this.src_schemas = list,
-                            DbSide::Dst => this.dst_schemas = list,
+                            DbSide::Dst => {
+                                this.dst_schemas = list;
+                                this.dst_schemas_loaded = true;
+                            }
                         }
                         let _ = count;
                         this.panel_mut(side).note = None;
-                        this.auto_pick_schema(side);
+                        if auto_pick {
+                            this.auto_pick_schema(side);
+                        }
                         if side == DbSide::Src && this.src_schema.is_some() {
                             this.load_tables(cx);
                         }
@@ -771,50 +1021,68 @@ impl RowBridgeApp {
     pub(crate) fn auto_pick_schema(&mut self, side: DbSide) {
         match side {
             DbSide::Src => {
-                if self.src_schema.is_some() {
-                    return;
-                }
-                if let Some(first) = self.src_schemas.first() {
-                    self.src_schema = Some(first.name.clone());
+                if self.src_schema.is_none() {
+                    if let Some(first) = self.src_schemas.first() {
+                        self.src_schema = Some(first.name.clone());
+                    }
                 }
                 self.sync_default_dst();
             }
-            DbSide::Dst => {
-                if self.dst_schema.is_some() {
-                    return;
-                }
-                if self.auto_dst_schema().is_some() {
-                    self.dst_schema = self.auto_dst_schema();
-                } else if let Some(first) = self.dst_schemas.first() {
-                    self.dst_schema = Some(first.name.clone());
-                }
-            }
+            DbSide::Dst => self.sync_default_dst(),
         }
     }
 
-    fn auto_dst_schema(&self) -> Option<String> {
-        let src = self.src_schema.as_deref()?;
-        let is_same = self.is_same_instance_cfg();
-        if is_same {
-            // 同实例时，优先避免选中同一个源库名
-            self.dst_schemas
-                .iter()
-                .find(|s| s.name != src)
-                .map(|s| s.name.clone())
-        } else {
-            self.dst_schemas
-                .iter()
-                .find(|s| s.name == src)
-                .map(|s| s.name.clone())
-        }
-    }
-
+    /// 目标库跟随源库同名：目标端有同名库就直接选中，没有就留空并记住要建的库名。
     pub(crate) fn sync_default_dst(&mut self) {
-        if self.dst_schema.is_none() {
-            if let Some(s) = self.auto_dst_schema() {
-                self.dst_schema = Some(s);
-            }
+        let Some(src) = self.src_schema.clone() else {
+            return;
+        };
+        // 目标数据源还没选/库列表还没拉到，先不动
+        if !self.dst_schemas_loaded {
+            return;
         }
+
+        let before = (self.dst_schema.clone(), self.dst_schema_wanted.clone());
+
+        if self.is_same_instance_cfg() {
+            // 同实例下「同名库」就是源库本身，自我同步没有意义，退而选一个别的库
+            if self.dst_schema.as_deref() == Some(src.as_str()) {
+                self.dst_schema = None;
+            }
+            if self.dst_schema.is_none() {
+                self.dst_schema = self
+                    .dst_schemas
+                    .iter()
+                    .find(|s| s.name != src)
+                    .map(|s| s.name.clone());
+            }
+            self.dst_schema_wanted = self.dst_schema.clone();
+        } else if self.dst_schemas.iter().any(|s| s.name == src) {
+            self.dst_schema = Some(src.clone());
+            self.dst_schema_wanted = Some(src);
+        } else {
+            // 目标端没有同名库：下拉留空，开始前会提示创建
+            self.dst_schema = None;
+            self.dst_schema_wanted = Some(src);
+        }
+
+        if before != (self.dst_schema.clone(), self.dst_schema_wanted.clone()) {
+            self.invalidate_report();
+        }
+    }
+
+    /// 目标库不存在时，用户确认后：建库开关打开 → 预检 →（通过则）自动开始。
+    pub(crate) fn create_target_db_and_start(&mut self, name: String, cx: &mut Context<Self>) {
+        self.dst_schema = Some(name.clone());
+        self.dst_schema_wanted = Some(name.clone());
+        self.opt.create_database = true;
+        self.start_after_preflight = true;
+        self.invalidate_report();
+        self.push_log(
+            "info",
+            format!("目标库 {name} 不存在，将在同步时按源库字符集创建"),
+        );
+        self.do_preflight(cx);
     }
 
     pub(crate) fn choose_schema(&mut self, side: DbSide, name: &str, cx: &mut Context<Self>) {
@@ -827,6 +1095,7 @@ impl RowBridgeApp {
             }
             DbSide::Dst => {
                 self.dst_schema = Some(name.to_string());
+                self.dst_schema_wanted = Some(name.to_string());
                 self.invalidate_report();
             }
         }
@@ -966,15 +1235,24 @@ impl RowBridgeApp {
                             "info",
                             format!("预检完成：{} 张表，{} 张阻塞", report.tables.len(), blocked),
                         );
+                        let passed = blocked == 0 && !report.any_blocking_error();
                         this.report = Some(report);
                         this.status = Some((
-                            blocked == 0,
-                            if blocked == 0 {
+                            passed,
+                            if passed {
                                 "预检通过".into()
                             } else {
                                 format!("{blocked} 张表被阻塞").into()
                             },
                         ));
+                        // 目标库不存在 → 确认创建 → 预检通过后直接开始
+                        if std::mem::take(&mut this.start_after_preflight) {
+                            if this.can_start() {
+                                this.do_start(cx);
+                            } else {
+                                this.push_log("warn", "建库后预检未通过，已取消自动开始");
+                            }
+                        }
                     }
                     Err(e) => {
                         this.report = None;
@@ -1177,6 +1455,8 @@ impl RowBridgeApp {
                         this.status = Some((false, format!("任务通道中断：{e}").into()));
                     }
                 }
+                // 同步过程中可能建了新库，刷新目标库列表，但不改动当前选择
+                this.refresh_schemas(DbSide::Dst, cx);
                 cx.notify();
             });
         })

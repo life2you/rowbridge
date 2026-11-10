@@ -203,7 +203,13 @@ impl RowBridgeApp {
             menu
         });
 
-        v_flex()
+        let missing_wanted = if side == DbSide::Dst {
+            self.missing_target_schema()
+        } else {
+            None
+        };
+
+        let mut col = v_flex()
             .gap_1()
             .child(
                 h_flex()
@@ -227,14 +233,32 @@ impl RowBridgeApp {
                                     .tooltip("重新加载数据库列表")
                                     .disabled(is_busy)
                                     .on_click(cx.listener(move |this, _, _, cx| {
-                                        this.load_schemas(side, cx);
+                                        this.refresh_schemas(side, cx);
                                         cx.notify();
                                     })),
                             ),
                     ),
             )
-            .child(dropdown)
-            .into_any_element()
+            .child(dropdown);
+
+        if let Some(name) = missing_wanted {
+            let warning = cx.theme().warning;
+            col = col.child(
+                h_flex()
+                    .gap_1()
+                    .items_center()
+                    .child(
+                        Icon::new(IconName::CircleAlert)
+                            .xsmall()
+                            .text_color(warning),
+                    )
+                    .child(div().text_xs().text_color(warning).child(format!(
+                        "目标端没有同名库 {name}，点「加入任务并开始」时可创建"
+                    ))),
+            );
+        }
+
+        col.into_any_element()
     }
 
     fn set_toggle(&mut self, key: &str, value: bool) {
@@ -562,6 +586,7 @@ impl RowBridgeApp {
         let muted = cx.theme().muted_foreground;
         let accent = cx.theme().accent;
 
+        let warning = cx.theme().warning;
         let mut head = card_head("同步批次", IconName::Replace, muted, border);
         head = head.child(chip(
             format!(
@@ -574,17 +599,31 @@ impl RowBridgeApp {
         ));
 
         let src_label = self.src_schema.clone().unwrap_or_else(|| "源库".into());
-        let dst_label = self.dst_schema.clone().unwrap_or_else(|| "目标库".into());
-        head = head
+        let dst_label = self
+            .dst_schema
+            .clone()
+            .or_else(|| self.dst_schema_wanted.clone())
+            .unwrap_or_else(|| "目标库".into());
+        // 库名不同不阻断，但要一眼能看出来
+        let differ = self.schema_names_differ();
+        let dst_color = if differ { warning } else { muted };
+        let mut route = h_flex()
+            .gap_1()
+            .items_center()
+            .child(div().text_xs().text_color(muted).child(src_label))
             .child(
-                h_flex()
-                    .gap_1()
-                    .items_center()
-                    .child(div().text_xs().text_color(muted).child(src_label))
-                    .child(Icon::new(IconName::ArrowRight).xsmall().text_color(muted))
-                    .child(div().text_xs().text_color(muted).child(dst_label)),
+                Icon::new(IconName::ArrowRight)
+                    .xsmall()
+                    .text_color(dst_color),
             )
-            .child(div().flex_1());
+            .child(div().text_xs().text_color(dst_color).child(dst_label));
+        if differ {
+            route = route.child(chip("库名不同", warning, accent));
+        }
+        if self.missing_target_schema().is_some() {
+            route = route.child(chip("目标库待创建", warning, accent));
+        }
+        head = head.child(route).child(div().flex_1());
 
         head = head
             .child(
@@ -607,6 +646,39 @@ impl RowBridgeApp {
                         .label("加入任务并开始")
                         .disabled(!self.can_start())
                         .on_click(cx.listener(|this, _: &ClickEvent, window, cx| {
+                            // 目标库还没建：先确认是否创建，确认后预检 + 自动开始
+                            if let Some(name) = this.missing_target_schema() {
+                                let entity = cx.entity().clone();
+                                let dst_host = this.dst.host_text(cx);
+                                let dst_port = this.dst.port_text(cx);
+                                let src_schema = this.src_schema.clone().unwrap_or_default();
+                                window.open_alert_dialog(cx, move |alert, _w, _cx| {
+                                    let entity = entity.clone();
+                                    let name = name.clone();
+                                    let dst_host = dst_host.clone();
+                                    let dst_port = dst_port.clone();
+                                    let src_schema = src_schema.clone();
+                                    alert
+                                        .confirm()
+                                        .title("目标库不存在")
+                                        .description(format!(
+                                            "目标实例 {dst_host}:{dst_port} 上没有数据库 `{name}`。\n\n\
+                                             将沿用源库 {src_schema} 的字符集与排序规则创建它，\
+                                             然后自动预检并开始同步。要继续吗？"
+                                        ))
+                                        .ok_text("创建并开始")
+                                        .cancel_text("取消")
+                                        .on_ok(move |_e, _w, cx| {
+                                            let name = name.clone();
+                                            entity.update(cx, |this, cx| {
+                                                this.create_target_db_and_start(name, cx);
+                                            });
+                                            true
+                                        })
+                                });
+                                return;
+                            }
+
                             let to_truncate = this.will_truncate_any();
                             if !to_truncate.is_empty() {
                                 let entity = cx.entity().clone();
