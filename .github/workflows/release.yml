@@ -59,6 +59,11 @@ jobs:
           cp target/release/rowbridge "$APP/Contents/MacOS/rowbridge"
           cp src-tauri/icons/icon.icns "$APP/Contents/Resources/icon.icns"
           cp src-tauri/Info.plist "$APP/Contents/Info.plist" 2>/dev/null || true
+          # 静态 Info.plist 里写的版本号会过期，打包时统一改成这次要发的版本
+          /usr/libexec/PlistBuddy -c "Set :CFBundleShortVersionString $VER" "$APP/Contents/Info.plist"
+          /usr/libexec/PlistBuddy -c "Set :CFBundleVersion $VER" "$APP/Contents/Info.plist"
+          /usr/libexec/PlistBuddy -c "Set :CFBundleExecutable rowbridge" "$APP/Contents/Info.plist"
+          echo "打包版本：$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' "$APP/Contents/Info.plist")"
           codesign --force --deep --sign - "$APP"
           STAGE=$(mktemp -d)
           cp -R "$APP" "$STAGE/"
