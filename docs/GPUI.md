@@ -40,7 +40,7 @@ cargo run -p rowbridge-gpui --release
 ```bash
 ./scripts/bundle-gpui.sh            # release 构建 → dist-gpui/RowBridge.app
 ./scripts/bundle-gpui.sh --debug    # 用现有 debug 二进制，秒出
-./scripts/bundle-gpui.sh --install  # 顺带复制到 /Applications
+./scripts/bundle-gpui.sh --install  # 顺带装到 /Applications/RowBridge Native.app
 ```
 
 `.app` 与 Tauri 版共用 `src-tauri/icons/icon.icns`，`CFBundleExecutable` 就叫 `RowBridge`，
