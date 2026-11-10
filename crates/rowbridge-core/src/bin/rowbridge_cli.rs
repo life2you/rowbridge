@@ -91,6 +91,12 @@ enum Cmd {
         truncate: bool,
         #[arg(long)]
         end_id: Option<String>,
+        /// 自定义起始 id（闭区间起点，填了自动切到自定义游标）
+        #[arg(long)]
+        start_id: Option<String>,
+        /// 附加字段过滤条件（SQL WHERE 表达式，如 `status = 1 AND deleted_at IS NULL`）
+        #[arg(long)]
+        filter: Option<String>,
         #[arg(long)]
         dry_run: bool,
         #[arg(long)]
@@ -124,7 +130,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             println!("{}", serde_json::to_string_pretty(&summaries)?);
         } else {
             for c in conns {
-                println!("{}\t{}\t{}:{}\t{}", c.id, c.name, c.host, c.port, c.username);
+                println!(
+                    "{}\t{}\t{}:{}\t{}",
+                    c.id, c.name, c.host, c.port, c.username
+                );
             }
         }
         return Ok(());
@@ -135,7 +144,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             .ok_or_else(|| format!("未找到名为 '{name}' 的源数据源配置"))?
             .to_conn_config(None)
     } else {
-        conn(&cli.src_host, cli.src_port, &cli.src_user, &cli.src_pass, None)
+        conn(
+            &cli.src_host,
+            cli.src_port,
+            &cli.src_user,
+            &cli.src_pass,
+            None,
+        )
     };
 
     let dst = if let Some(name) = &cli.dst_conn {
@@ -143,7 +158,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             .ok_or_else(|| format!("未找到名为 '{name}' 的目标数据源配置"))?
             .to_conn_config(None)
     } else {
-        conn(&cli.dst_host, cli.dst_port, &cli.dst_user, &cli.dst_pass, None)
+        conn(
+            &cli.dst_host,
+            cli.dst_port,
+            &cli.dst_user,
+            &cli.dst_pass,
+            None,
+        )
     };
 
     match cli.cmd {
@@ -173,9 +194,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 let out: Vec<_> = tables
                     .iter()
                     .map(|t| {
-                        let is_view = t.table_type.as_deref().map(|ty| ty.eq_ignore_ascii_case("VIEW")).unwrap_or(false);
+                        let is_view = t
+                            .table_type
+                            .as_deref()
+                            .map(|ty| ty.eq_ignore_ascii_case("VIEW"))
+                            .unwrap_or(false);
                         let pk = pk_map.get(&t.name).cloned();
-                        let syncable = !is_view && pk.as_ref().map(|p| p.len() == 1).unwrap_or(false);
+                        let syncable =
+                            !is_view && pk.as_ref().map(|p| p.len() == 1).unwrap_or(false);
                         serde_json::json!({
                             "name": t.name,
                             "rows_estimate": t.rows_estimate.unwrap_or(0),
@@ -230,6 +256,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     start_id: None,
                     end_id: None,
                     truncate_target: None,
+                    create_table: None,
+                    continue_on_error: None,
+                    strip_auto_increment: None,
+                    strip_foreign_keys: None,
+                    map_collation: None,
+                    filter: None,
                 })
                 .collect();
             let options = TaskOptions::default();
@@ -278,6 +310,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             cursor,
             truncate,
             end_id,
+            start_id,
+            filter,
             dry_run,
             no_adaptive,
             disable_foreign_key_checks,
@@ -295,6 +329,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     start_id: None,
                     end_id: None,
                     truncate_target: None,
+                    create_table: None,
+                    continue_on_error: None,
+                    strip_auto_increment: None,
+                    strip_foreign_keys: None,
+                    map_collation: None,
+                    filter: filter.clone(),
                 })
                 .collect();
 
@@ -302,13 +342,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 parallelism: parallel,
                 batch_size: batch,
                 adaptive_batch: !no_adaptive,
-                cursor_start: if cursor == "resume" {
+                cursor_start: if start_id.is_some() {
+                    CursorStart::Custom
+                } else if cursor == "resume" {
                     CursorStart::Resume
                 } else {
                     CursorStart::Full
                 },
                 truncate_target: truncate,
                 end_id,
+                start_id,
                 disable_foreign_key_checks,
                 relax_sql_mode,
                 continue_on_error: true,
@@ -341,9 +384,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                             t.table,
                             t.target_schema,
                             t.target_table,
-                            t.source_rows_estimate,
+                            t.planned_rows,
                             t.source_max_pk,
                             t.target_max_pk
+                        );
+                        println!(
+                            "    预计同步 {} 行（{}）",
+                            t.planned_rows,
+                            if t.planned_rows_exact {
+                                "源库精确统计"
+                            } else {
+                                "区间估算"
+                            }
                         );
                         for c in &t.checks {
                             println!("    [{:?}] {}", c.severity, c.message);
@@ -445,7 +497,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 }
             });
 
-            let result = engine::run_task(cfg, &report, sink, cancel).await?;
+            let result = engine::run_task(
+                cfg,
+                &report,
+                sink,
+                cancel,
+                rowbridge_core::engine::PauseController::default(),
+            )
+            .await?;
             let _ = printer.await;
 
             if cli.json {

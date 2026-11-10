@@ -3,8 +3,8 @@
 //! 用可读的 JSON 而不是数据库，方便用户直接查看、备份、手工编辑，
 //! 同时也方便 CLI 和 AI Agent 复用已配置的数据源。
 
-use std::path::PathBuf;
 use serde::{Deserialize, Serialize};
+use std::path::PathBuf;
 
 use crate::config::ConnConfig;
 
@@ -73,7 +73,8 @@ fn load() -> Result<File, String> {
     if !p.exists() {
         return Ok(File::default());
     }
-    let text = std::fs::read_to_string(&p).map_err(|e| format!("读取 {} 失败: {e}", p.display()))?;
+    let text =
+        std::fs::read_to_string(&p).map_err(|e| format!("读取 {} 失败: {e}", p.display()))?;
     Ok(serde_json::from_str(&text).unwrap_or_default())
 }
 

@@ -49,7 +49,7 @@ impl Error {
                 | 1153      // 包过大
                 | 1205      // 锁等待超时
                 | 1213      // 死锁
-                | 1040      // too many connections
+                | 1040 // too many connections
             ),
             Error::Io(_) => true,
             _ => false,
@@ -59,7 +59,13 @@ impl Error {
     /// 是否应该缩减批大小后重试。
     pub fn should_shrink_batch(&self) -> bool {
         // 1153 = 包过大；2006 = 连接断开；1390 = 占位符过多（宽表）
-        matches!(self, Error::MySql { code: 1153 | 2006 | 1390, .. })
+        matches!(
+            self,
+            Error::MySql {
+                code: 1153 | 2006 | 1390,
+                ..
+            }
+        )
     }
 
     pub fn code(&self) -> Option<u16> {

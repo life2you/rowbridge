@@ -1,14 +1,19 @@
 //! `information_schema` 内省。
 
-use serde::{Deserialize, Serialize};
 use mysql_async::prelude::*;
+use serde::{Deserialize, Serialize};
 
 use crate::value::quote_ident;
 use crate::{Error, Result};
 
 /// 整型主键类型白名单。
 pub const INT_TYPES: &[&str] = &[
-    "tinyint", "smallint", "mediumint", "int", "integer", "bigint",
+    "tinyint",
+    "smallint",
+    "mediumint",
+    "int",
+    "integer",
+    "bigint",
 ];
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -231,7 +236,16 @@ pub async fn table_detail(
     let columns = col_rows
         .into_iter()
         .map(
-            |(name, data_type, column_type, is_nullable, column_default, extra, charset, collation)| {
+            |(
+                name,
+                data_type,
+                column_type,
+                is_nullable,
+                column_default,
+                extra,
+                charset,
+                collation,
+            )| {
                 ColumnInfo {
                     is_primary: primary_key.contains(&name),
                     name,
@@ -301,7 +315,9 @@ pub fn parse_version(v: &str) -> (u16, u16, u16) {
 
 pub async fn is_mariadb(conn: &mut mysql_async::Conn) -> Result<bool> {
     let v: Option<String> = conn.query_first("SELECT VERSION()").await?;
-    Ok(v.unwrap_or_default().to_ascii_lowercase().contains("mariadb"))
+    Ok(v.unwrap_or_default()
+        .to_ascii_lowercase()
+        .contains("mariadb"))
 }
 
 /// 读取 max_allowed_packet（字节）。

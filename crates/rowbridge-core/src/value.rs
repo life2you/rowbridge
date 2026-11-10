@@ -186,10 +186,7 @@ mod tests {
 
     #[test]
     fn parses_custom_cursor_by_sign() {
-        assert_eq!(
-            parse_cursor_value("42", false).unwrap(),
-            Value::Int(42)
-        );
+        assert_eq!(parse_cursor_value("42", false).unwrap(), Value::Int(42));
         assert_eq!(
             parse_cursor_value("18446744073709551615", true).unwrap(),
             Value::UInt(u64::MAX)

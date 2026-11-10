@@ -12,6 +12,7 @@
 //! 写入端用 `INSERT ... ON DUPLICATE KEY UPDATE`，因此任务可随时中断重跑，
 //! 断点由目标表 `MAX(pk)` 自然推导，不需要额外的进度表。
 
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -38,9 +39,18 @@ const MIN_BATCH: usize = 100;
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum Event {
-    TaskStarted { tables: usize },
-    TableStarted { table: String, columns: usize, needs_create_table: bool },
-    TableCreated { table: String, ddl: String },
+    TaskStarted {
+        tables: usize,
+    },
+    TableStarted {
+        table: String,
+        columns: usize,
+        needs_create_table: bool,
+    },
+    TableCreated {
+        table: String,
+        ddl: String,
+    },
     BatchDone {
         table: String,
         rows: u64,
@@ -50,11 +60,30 @@ pub enum Event {
         batch_size: usize,
         elapsed_ms: u64,
     },
-    TableDone { table: String, rows: u64, elapsed_ms: u64 },
-    TableFailed { table: String, error: String },
-    Warning { table: Option<String>, message: String },
-    Log { table: Option<String>, level: String, message: String },
-    TaskDone { total_rows: u64, succeeded: usize, failed: usize, elapsed_ms: u64 },
+    TableDone {
+        table: String,
+        rows: u64,
+        elapsed_ms: u64,
+    },
+    TableFailed {
+        table: String,
+        error: String,
+    },
+    Warning {
+        table: Option<String>,
+        message: String,
+    },
+    Log {
+        table: Option<String>,
+        level: String,
+        message: String,
+    },
+    TaskDone {
+        total_rows: u64,
+        succeeded: usize,
+        failed: usize,
+        elapsed_ms: u64,
+    },
     Cancelled,
 }
 
@@ -127,6 +156,7 @@ struct TableRun {
     dst_schema: String,
     src_table: String,
     dst_table: String,
+    filter: Option<String>,
 }
 
 /// 仅同步表结构（包括自动建库、创建缺失表、为已有表追加缺失列）。
@@ -168,10 +198,12 @@ pub async fn sync_schema(
             if let Some(ct) = &pf.create_table {
                 match dst.query_drop(&ct.ddl).await {
                     Ok(()) => {
-                        out.tables_created.push(format!("{}.{}", pf.target_schema, pf.target_table));
+                        out.tables_created
+                            .push(format!("{}.{}", pf.target_schema, pf.target_table));
                     }
                     Err(e) => {
-                        let err_msg = format!("创建表 {}.{} 失败: {e}", pf.target_schema, pf.target_table);
+                        let err_msg =
+                            format!("创建表 {}.{} 失败: {e}", pf.target_schema, pf.target_table);
                         out.errors.push(err_msg.clone());
                         if !cfg.options.continue_on_error {
                             return Err(Error::Other(err_msg));
@@ -205,22 +237,59 @@ pub async fn sync_schema(
     Ok(out)
 }
 
+/// 任务暂停与恢复控制器。
+#[derive(Clone, Default)]
+pub struct PauseController {
+    paused: Arc<AtomicBool>,
+    notify: Arc<tokio::sync::Notify>,
+}
+
+impl PauseController {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// 触发暂停
+    pub fn pause(&self) {
+        self.paused.store(true, Ordering::SeqCst);
+    }
+
+    /// 恢复继续
+    pub fn resume(&self) {
+        self.paused.store(false, Ordering::SeqCst);
+        self.notify.notify_waiters();
+    }
+
+    /// 当前是否处于暂停状态
+    pub fn is_paused(&self) -> bool {
+        self.paused.load(Ordering::SeqCst)
+    }
+
+    /// 若处于暂停状态，则异步等待直到被恢复或取消
+    pub async fn check_pause(&self, cancel: &CancellationToken) {
+        while self.is_paused() && !cancel.is_cancelled() {
+            tokio::select! {
+                _ = self.notify.notified() => {}
+                _ = cancel.cancelled() => break,
+            }
+        }
+    }
+}
+
 /// 执行整个同步任务（多表并行）。
 pub async fn run_task(
     cfg: TaskConfig,
     preflight: &preflight::PreflightReport,
     sink: EventSink,
     cancel: CancellationToken,
+    pause: PauseController,
 ) -> Result<TaskReport> {
     let started = Instant::now();
     let opts = cfg.options.clone();
     let parallelism = opts.parallelism.max(1);
 
-    let mut runnable: Vec<TablePreflight> = preflight
-        .syncable_tables()
-        .into_iter()
-        .cloned()
-        .collect();
+    let mut runnable: Vec<TablePreflight> =
+        preflight.syncable_tables().into_iter().cloned().collect();
     if runnable.is_empty() {
         return Err(Error::Preflight("没有可同步的表（预检全部未通过）".into()));
     }
@@ -240,13 +309,32 @@ pub async fn run_task(
         if cancel.is_cancelled() {
             break;
         }
-        let should_truncate = cfg
-            .tables
-            .iter()
-            .find(|t| t.table == pf.table)
+        pause.check_pause(&cancel).await;
+        if cancel.is_cancelled() {
+            break;
+        }
+        let tbl_cfg = cfg.tables.iter().find(|t| t.table == pf.table);
+        let should_truncate = tbl_cfg
             .map(|t| t.effective_truncate_target(&opts))
             .unwrap_or(opts.truncate_target);
-        match prepare_table(&mut src, &mut dst, &pf, &opts, should_truncate, &sink).await {
+        let should_create = tbl_cfg
+            .map(|t| t.effective_create_table(&opts))
+            .unwrap_or(opts.create_table);
+        let should_continue = tbl_cfg
+            .map(|t| t.effective_continue_on_error(&opts))
+            .unwrap_or(opts.continue_on_error);
+
+        match prepare_table(
+            &mut src,
+            &mut dst,
+            &pf,
+            &opts,
+            should_truncate,
+            should_create,
+            &sink,
+        )
+        .await
+        {
             Ok(()) => ready.push(pf),
             Err(e) => {
                 sink.emit(Event::TableFailed {
@@ -260,7 +348,7 @@ pub async fn run_task(
                     error: Some(e.to_string()),
                     ..Default::default()
                 });
-                if !opts.continue_on_error {
+                if !should_continue {
                     drop(src);
                     drop(dst);
                     return Err(e);
@@ -284,6 +372,7 @@ pub async fn run_task(
         let opts = opts.clone();
         let sink = sink.clone();
         let cancel = cancel.clone();
+        let pause = pause.clone();
         // 按表名找回它自己的配置；找不到就用手上这份
         let table_cfg = cfg
             .tables
@@ -295,16 +384,12 @@ pub async fn run_task(
                 src_schema: pf.source_schema.clone(),
                 dst_schema: pf.target_schema.clone(),
                 dst_table: Some(pf.target_table.clone()),
-                columns: Vec::new(),
-                cursor_start: None,
-                start_id: None,
-                end_id: None,
-                truncate_target: None,
+                ..Default::default()
             });
 
         futs.push(tokio::spawn(async move {
             let _permit = permit;
-            run_table(src_cfg, dst_cfg, opts, table_cfg, pf, sink, cancel).await
+            run_table(src_cfg, dst_cfg, opts, table_cfg, pf, sink, cancel, pause).await
         }));
     }
 
@@ -372,6 +457,7 @@ async fn prepare_table(
     pf: &TablePreflight,
     opts: &TaskOptions,
     should_truncate: bool,
+    should_create: bool,
     sink: &EventSink,
 ) -> Result<()> {
     if pf.has_blocking_error() {
@@ -438,7 +524,7 @@ async fn prepare_table(
         return Ok(());
     }
 
-    if !opts.create_table {
+    if !should_create {
         return Err(Error::Other(format!(
             "目标表 {}.{} 不存在且未开启自动建表",
             pf.target_schema, pf.target_table
@@ -465,10 +551,7 @@ async fn prepare_table(
     Ok(())
 }
 
-async fn source_schema_charset(
-    conn: &mut Conn,
-    schema: &str,
-) -> Result<(String, String)> {
+async fn source_schema_charset(conn: &mut Conn, schema: &str) -> Result<(String, String)> {
     let row: Option<(Option<String>, Option<String>)> = conn
         .exec_first(
             "SELECT DEFAULT_CHARACTER_SET_NAME, DEFAULT_COLLATION_NAME
@@ -492,6 +575,7 @@ async fn run_table(
     pf: TablePreflight,
     sink: EventSink,
     cancel: CancellationToken,
+    pause: PauseController,
 ) -> Result<TableStats> {
     let table = pf.table.clone();
     let started = Instant::now();
@@ -509,7 +593,7 @@ async fn run_table(
     };
 
     let result = sync_one(
-        &src_cfg, &dst_cfg, &opts, &table_cfg, &pf, &sink, &cancel, &mut stats,
+        &src_cfg, &dst_cfg, &opts, &table_cfg, &pf, &sink, &cancel, &pause, &mut stats,
     )
     .await;
     stats.elapsed_ms = started.elapsed().as_millis() as u64;
@@ -557,6 +641,7 @@ async fn sync_one(
     pf: &TablePreflight,
     sink: &EventSink,
     cancel: &CancellationToken,
+    pause: &PauseController,
     stats: &mut TableStats,
 ) -> Result<()> {
     let pk = pf
@@ -631,9 +716,8 @@ async fn sync_one(
     let (end_id, end_pk) = match &eff_end_id {
         Some(s) => {
             let v = parse_cursor_value(s, pf.primary_key_unsigned)?;
-            let as_int = value::value_as_i128(&v).ok_or_else(|| {
-                Error::Config(format!("结束游标 `{s}` 不是合法整数"))
-            })?;
+            let as_int = value::value_as_i128(&v)
+                .ok_or_else(|| Error::Config(format!("结束游标 `{s}` 不是合法整数")))?;
             (Some(as_int), Some(v))
         }
         None => (None, None),
@@ -675,7 +759,16 @@ async fn sync_one(
         dst_schema: pf.target_schema.clone(),
         src_table: pf.table.clone(),
         dst_table: pf.target_table.clone(),
+        filter: pf.filter.clone(),
     };
+
+    if let Some(f) = &run.filter {
+        sink.emit(Event::Log {
+            table: Some(pf.table.clone()),
+            level: "info".into(),
+            message: format!("附加条件过滤: {f}"),
+        });
+    }
 
     if !run.cursor.is_start() {
         let op = if run.cursor_inclusive { ">=" } else { ">" };
@@ -699,19 +792,17 @@ async fn sync_one(
         if cancel.is_cancelled() {
             break;
         }
+        pause.check_pause(cancel).await;
+        if cancel.is_cancelled() {
+            break;
+        }
 
         let start = Instant::now();
         // 记录本批实际使用的批大小。自适应会改动 run.batch_size，
         // 若用改动后的值判断「是否已读完」，批大小翻倍时会误判提前结束而静默丢行。
         let fetch_size = run.batch_size;
-        let (rows, wire_bytes) = fetch_batch_retry(
-            &mut src,
-            src_cfg,
-            opts,
-            &run,
-            sink,
-            &pf.table,
-        ).await?;
+        let (rows, wire_bytes) =
+            fetch_batch_retry(&mut src, src_cfg, opts, &run, sink, &pf.table).await?;
         if rows.is_empty() {
             break;
         }
@@ -755,7 +846,8 @@ async fn sync_one(
             sink,
             &pf.table,
             &mut sql_cache,
-        ).await;
+        )
+        .await;
 
         match write_result {
             Ok(()) => {}
@@ -957,6 +1049,12 @@ async fn fetch_batch(src: &mut Conn, run: &TableRun) -> Result<(Vec<Vec<Value>>,
         conds.push(format!("{} <= ?", quote_ident(&run.pk)));
         params.push(end.clone());
     }
+    if let Some(filter) = &run.filter {
+        let trimmed = filter.trim();
+        if !trimmed.is_empty() {
+            conds.push(format!("({trimmed})"));
+        }
+    }
 
     let where_clause = if conds.is_empty() {
         String::new()
@@ -1004,7 +1102,10 @@ fn build_write_sql(
         .join(", ");
     let row_placeholder = format!(
         "({})",
-        std::iter::repeat("?").take(ncols).collect::<Vec<_>>().join(",")
+        std::iter::repeat("?")
+            .take(ncols)
+            .collect::<Vec<_>>()
+            .join(",")
     );
     let values_clause = std::iter::repeat(row_placeholder.as_str())
         .take(row_count)
@@ -1104,14 +1205,17 @@ async fn apply_session_opts(conn: &mut Conn, opts: &TaskOptions, is_target: bool
         return Ok(());
     }
     if opts.disable_foreign_key_checks {
-        conn.query_drop("SET SESSION foreign_key_checks = 0").await?;
+        conn.query_drop("SET SESSION foreign_key_checks = 0")
+            .await?;
     }
     if opts.relax_sql_mode {
         conn.query_drop("SET SESSION sql_mode = ''").await?;
     }
     // 大字段传输时避免超时
-    conn.query_drop("SET SESSION net_write_timeout = 600").await?;
-    conn.query_drop("SET SESSION net_read_timeout = 600").await?;
+    conn.query_drop("SET SESSION net_write_timeout = 600")
+        .await?;
+    conn.query_drop("SET SESSION net_read_timeout = 600")
+        .await?;
     Ok(())
 }
 

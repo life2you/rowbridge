@@ -18,7 +18,6 @@ use tauri::State;
 use tokio::sync::Mutex;
 use tokio_util::sync::CancellationToken;
 
-
 pub struct AppState {
     /// 正在运行的任务：taskId → 取消令牌
     pub tasks: Mutex<HashMap<String, CancellationToken>>,
@@ -97,7 +96,6 @@ pub struct TableRow {
     pub max_pk: Option<u64>,
 }
 
-
 #[tauri::command]
 pub async fn test_connection(form: ConnForm) -> Result<TestResult, String> {
     let cfg = form.resolve()?;
@@ -106,7 +104,10 @@ pub async fn test_connection(form: ConnForm) -> Result<TestResult, String> {
         .map_err(|e| format!("连接失败: {e}"))?;
     let version = introspect::server_version(&mut conn).await.map_err(err)?;
     let is_mariadb = introspect::is_mariadb(&mut conn).await.map_err(err)?;
-    let schemas = introspect::list_schemas(&mut conn).await.map_err(err)?.len();
+    let schemas = introspect::list_schemas(&mut conn)
+        .await
+        .map_err(err)?
+        .len();
     let _ = conn.disconnect().await;
     Ok(TestResult {
         version: format!("{}.{}.{}", version.0, version.1, version.2),
@@ -127,10 +128,7 @@ pub async fn list_schemas(form: ConnForm) -> Result<Vec<introspect::SchemaInfo>,
 }
 
 #[tauri::command]
-pub async fn list_tables(
-    form: ConnForm,
-    schema: String,
-) -> Result<Vec<TableRow>, String> {
+pub async fn list_tables(form: ConnForm, schema: String) -> Result<Vec<TableRow>, String> {
     let cfg = form.resolve()?;
     let mut conn = mysql_async::Conn::new(cfg.to_url().map_err(err)?)
         .await
@@ -140,8 +138,12 @@ pub async fn list_tables(
     // 1. TABLES 拿表清单
     // 2. 全库主键（一次批量），用于「不支持」置灰
     // 重活（COLUMNS/TRIGGERS/MAX(id)）交给 validate_tables，勾选时按需执行。
-    let tables = introspect::list_tables(&mut conn, &schema).await.map_err(err)?;
-    let pk_rows = introspect::list_primary_keys(&mut conn, &schema).await.map_err(err)?;
+    let tables = introspect::list_tables(&mut conn, &schema)
+        .await
+        .map_err(err)?;
+    let pk_rows = introspect::list_primary_keys(&mut conn, &schema)
+        .await
+        .map_err(err)?;
 
     // (表名 -> (按序主键列, 复合主键))
     let mut pk_map: std::collections::HashMap<String, (Vec<String>, bool)> =
@@ -155,7 +157,11 @@ pub async fn list_tables(
     for t in tables {
         let mut primary_key: Option<String> = None;
         let mut unsupported_reason: Option<String> = None;
-        if t.table_type.as_deref().map(|ty| ty.eq_ignore_ascii_case("VIEW")).unwrap_or(false) {
+        if t.table_type
+            .as_deref()
+            .map(|ty| ty.eq_ignore_ascii_case("VIEW"))
+            .unwrap_or(false)
+        {
             unsupported_reason = Some("视图".into());
         } else if let Some((cols, _)) = pk_map.get(&t.name) {
             if cols.len() > 1 {
@@ -176,7 +182,11 @@ pub async fn list_tables(
             engine: t.engine,
             primary_key,
             unsupported_reason,
-            is_view: t.table_type.as_deref().map(|ty| ty.eq_ignore_ascii_case("VIEW")).unwrap_or(false),
+            is_view: t
+                .table_type
+                .as_deref()
+                .map(|ty| ty.eq_ignore_ascii_case("VIEW"))
+                .unwrap_or(false),
             max_pk: None, // 懒加载：勾选时才取
         });
     }
@@ -242,14 +252,20 @@ async fn validate_one(
     schema: &str,
     table: &str,
 ) -> Result<ValidatedTable, String> {
-    let detail = introspect::table_detail(conn, schema, table).await.map_err(err)?;
+    let detail = introspect::table_detail(conn, schema, table)
+        .await
+        .map_err(err)?;
     let (primary_key, primary_key_unsigned, unsupported_reason) = match detail.pk_column() {
         Ok(col) => (
             Some(col.name.clone()),
             col.column_type.to_ascii_lowercase().contains("unsigned"),
             None,
         ),
-        Err(e) => (detail.primary_key.first().cloned(), false, Some(e.to_string())),
+        Err(e) => (
+            detail.primary_key.first().cloned(),
+            false,
+            Some(e.to_string()),
+        ),
     };
 
     let max_pk = match &primary_key {
@@ -446,6 +462,12 @@ fn to_task_config(req: &RunRequest) -> Result<TaskConfig, String> {
             start_id: t.start_id.clone(),
             end_id: t.end_id.clone(),
             truncate_target: t.truncate_target,
+            create_table: None,
+            continue_on_error: None,
+            strip_auto_increment: None,
+            strip_foreign_keys: None,
+            map_collation: None,
+            filter: None,
         })
         .collect();
     Ok(TaskConfig {
@@ -527,7 +549,14 @@ pub async fn start_sync(
         }
     });
 
-    let result = engine::run_task(cfg, &report, sink, cancel).await;
+    let result = engine::run_task(
+        cfg,
+        &report,
+        sink,
+        cancel,
+        rowbridge_core::engine::PauseController::default(),
+    )
+    .await;
     let _ = forwarder.await;
 
     {
@@ -548,10 +577,7 @@ pub async fn start_sync(
 }
 
 #[tauri::command]
-pub async fn cancel_sync(
-    state: State<'_, Arc<AppState>>,
-    task_id: String,
-) -> Result<bool, String> {
+pub async fn cancel_sync(state: State<'_, Arc<AppState>>, task_id: String) -> Result<bool, String> {
     let tasks = state.tasks.lock().await;
     match tasks.get(&task_id) {
         Some(token) => {
@@ -577,7 +603,6 @@ pub fn task_logs(
 ) -> Result<Vec<crate::store::LogRow>, String> {
     crate::store::task_logs(app, &task_id, limit.unwrap_or(500))
 }
-
 
 // ---------------------------------------------------------------- 数据源
 

@@ -6,9 +6,7 @@
 //!
 //! 这里测的是 CLI 覆盖不到的部分：同一批任务里，不同表用各自的游标区间。
 
-use rowbridge_core::config::{
-    ConnConfig, CursorStart, TableTaskConfig, TaskConfig, TaskOptions,
-};
+use rowbridge_core::config::{ConnConfig, CursorStart, TableTaskConfig, TaskConfig, TaskOptions};
 use rowbridge_core::engine::{self, EventSink};
 use rowbridge_core::preflight;
 use tokio_util::sync::CancellationToken;
@@ -52,12 +50,20 @@ fn task_in(
         start_id: start.map(str::to_string),
         end_id: end.map(str::to_string),
         truncate_target: None,
+        create_table: None,
+        continue_on_error: None,
+        strip_auto_increment: None,
+        strip_foreign_keys: None,
+        map_collation: None,
+        filter: None,
     }
 }
 
 async fn count(schema: &str, table: &str) -> u64 {
     use mysql_async::prelude::*;
-    let mut c = mysql_async::Conn::new(dst().to_url().unwrap()).await.unwrap();
+    let mut c = mysql_async::Conn::new(dst().to_url().unwrap())
+        .await
+        .unwrap();
     let n: Option<u64> = c
         .query_first(format!("SELECT COUNT(*) FROM `{schema}`.`{table}`"))
         .await
@@ -90,12 +96,18 @@ async fn per_table_cursors_are_independent() {
     }
 
     // 三张表，三种不同的游标策略：
-    //   bulk   自定义 1000 → 2000，应恰好 1000 行
-    //   simple 自定义 id > 2，应恰好 3 行（3、4、5）
+    //   bulk   自定义 1001 → 2000，应恰好 1000 行
+    //   simple 自定义 id >= 3，应恰好 3 行（3、4、5）
     //   empty_t 全量，应为 0 行
     let tables = vec![
-        task_in(DB, "bulk", Some(CursorStart::Custom), Some("1000"), Some("2000")),
-        task_in(DB, "simple", Some(CursorStart::Custom), Some("2"), None),
+        task_in(
+            DB,
+            "bulk",
+            Some(CursorStart::Custom),
+            Some("1001"),
+            Some("2000"),
+        ),
+        task_in(DB, "simple", Some(CursorStart::Custom), Some("3"), None),
         task_in(DB, "empty_t", Some(CursorStart::Full), None, None),
     ];
 
@@ -118,8 +130,12 @@ async fn per_table_cursors_are_independent() {
         options: options.clone(),
     };
 
-    let mut sc = mysql_async::Conn::new(src().to_url().unwrap()).await.unwrap();
-    let mut dc = mysql_async::Conn::new(dst().to_url().unwrap()).await.unwrap();
+    let mut sc = mysql_async::Conn::new(src().to_url().unwrap())
+        .await
+        .unwrap();
+    let mut dc = mysql_async::Conn::new(dst().to_url().unwrap())
+        .await
+        .unwrap();
     let report = preflight::run(&mut sc, &mut dc, &tables, &options, false)
         .await
         .expect("预检失败");
@@ -130,6 +146,7 @@ async fn per_table_cursors_are_independent() {
         &report,
         EventSink::silent(),
         CancellationToken::new(),
+        engine::PauseController::default(),
     )
     .await
     .expect("任务失败");
@@ -146,7 +163,9 @@ async fn per_table_cursors_are_independent() {
     // 再确认边界值，确保不是「数量碰巧对上」
     {
         use mysql_async::prelude::*;
-        let mut c = mysql_async::Conn::new(dst().to_url().unwrap()).await.unwrap();
+        let mut c = mysql_async::Conn::new(dst().to_url().unwrap())
+            .await
+            .unwrap();
         let b: Option<(u64, u64)> = c
             .query_first(format!("SELECT MIN(id), MAX(id) FROM `{DB}`.bulk"))
             .await
@@ -188,15 +207,25 @@ async fn global_cursor_still_applies_when_table_has_no_override() {
         options: options.clone(),
     };
 
-    let mut sc = mysql_async::Conn::new(src().to_url().unwrap()).await.unwrap();
-    let mut dc = mysql_async::Conn::new(dst().to_url().unwrap()).await.unwrap();
+    let mut sc = mysql_async::Conn::new(src().to_url().unwrap())
+        .await
+        .unwrap();
+    let mut dc = mysql_async::Conn::new(dst().to_url().unwrap())
+        .await
+        .unwrap();
     let report = preflight::run(&mut sc, &mut dc, &tables, &options, false)
         .await
         .expect("预检失败");
 
-    engine::run_task(cfg, &report, EventSink::silent(), CancellationToken::new())
-        .await
-        .expect("任务失败");
+    engine::run_task(
+        cfg,
+        &report,
+        EventSink::silent(),
+        CancellationToken::new(),
+        engine::PauseController::default(),
+    )
+    .await
+    .expect("任务失败");
 
     assert_eq!(count(DB, "bulk").await, 200, "应继承全局结束 id");
 }

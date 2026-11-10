@@ -13,9 +13,10 @@ static DB_PATH: OnceLock<std::path::PathBuf> = OnceLock::new();
 static DB_CONN: OnceLock<std::sync::Mutex<Connection>> = OnceLock::new();
 
 fn path() -> std::path::PathBuf {
-    DB_PATH.get().cloned().unwrap_or_else(|| {
-        std::env::temp_dir().join("rowbridge-fallback.db")
-    })
+    DB_PATH
+        .get()
+        .cloned()
+        .unwrap_or_else(|| std::env::temp_dir().join("rowbridge-fallback.db"))
 }
 
 /// 启动时调用一次。
@@ -111,20 +112,18 @@ pub fn record_event(app: tauri::AppHandle, task_id: &str, ev: &Event) {
             level,
             message,
         } => Some((level.as_str(), table.clone(), message.clone())),
-        Event::TableCreated { table, .. } => Some((
-            "info",
-            Some(table.clone()),
-            "已在目标端创建表".to_string(),
-        )),
-        Event::TableFailed { table, error } => Some((
-            "error",
-            Some(table.clone()),
-            format!("同步失败: {error}"),
-        )),
-        Event::Warning { table, message } => {
-            Some(("warn", table.clone(), message.clone()))
+        Event::TableCreated { table, .. } => {
+            Some(("info", Some(table.clone()), "已在目标端创建表".to_string()))
         }
-        Event::TableDone { table, rows, elapsed_ms } => Some((
+        Event::TableFailed { table, error } => {
+            Some(("error", Some(table.clone()), format!("同步失败: {error}")))
+        }
+        Event::Warning { table, message } => Some(("warn", table.clone(), message.clone())),
+        Event::TableDone {
+            table,
+            rows,
+            elapsed_ms,
+        } => Some((
             "info",
             Some(table.clone()),
             format!("完成 {rows} 行，耗时 {elapsed_ms}ms"),
@@ -148,7 +147,11 @@ pub fn record_event(app: tauri::AppHandle, task_id: &str, ev: &Event) {
 
 pub fn finish_task(app: tauri::AppHandle, task_id: &str, report: &TaskReport) {
     let _ = app;
-    let status = if report.cancelled { "cancelled" } else { "done" };
+    let status = if report.cancelled {
+        "cancelled"
+    } else {
+        "done"
+    };
     let _ = with_conn(|conn| {
         conn.execute(
             "UPDATE tasks SET status=?, total_rows=?, succeeded=?, failed=?, elapsed_ms=?, finished_at=? WHERE id=?",
@@ -221,7 +224,8 @@ pub fn list_tasks(app: tauri::AppHandle) -> Result<Vec<TaskSummary>, String> {
                 })
             })
             .map_err(|e| e.to_string())?;
-        rows.collect::<Result<Vec<_>, _>>().map_err(|e| e.to_string())
+        rows.collect::<Result<Vec<_>, _>>()
+            .map_err(|e| e.to_string())
     })
 }
 
@@ -256,6 +260,7 @@ pub fn task_logs(
                 })
             })
             .map_err(|e| e.to_string())?;
-        rows.collect::<Result<Vec<_>, _>>().map_err(|e| e.to_string())
+        rows.collect::<Result<Vec<_>, _>>()
+            .map_err(|e| e.to_string())
     })
 }

@@ -109,7 +109,8 @@ pub fn rewrite_create_table(original: &str, opts: &RewriteOptions) -> RewriteRes
             warnings.push("源表含 INVISIBLE 列，目标端 MySQL < 8.0.23 不支持".into());
         }
         if lower.contains("default (") {
-            warnings.push("源表含表达式默认值 `DEFAULT (expr)`，目标端 MySQL < 8.0.13 不支持".into());
+            warnings
+                .push("源表含表达式默认值 `DEFAULT (expr)`，目标端 MySQL < 8.0.13 不支持".into());
         }
         if lower.contains("engine=innodb") && lower.contains("row_format") {
             // 无害
@@ -185,7 +186,9 @@ fn parse_qualified_name_end(s: &str) -> Option<usize> {
                 i += 1;
             }
         } else {
-            while i < bytes.len() && (bytes[i].is_ascii_alphanumeric() || bytes[i] == b'_' || bytes[i] == b'$') {
+            while i < bytes.len()
+                && (bytes[i].is_ascii_alphanumeric() || bytes[i] == b'_' || bytes[i] == b'$')
+            {
                 i += 1;
             }
             if i == last_end {
@@ -251,8 +254,10 @@ fn strip_foreign_keys(ddl: &str) -> (String, Vec<String>) {
             continue;
         }
 
-        let is_fk_start = (lower.starts_with("constraint") && (lower.contains("foreign key") || lower.contains("references")))
-            || (lower.starts_with("foreign key") && (lower.contains("references") || lower.contains('(')));
+        let is_fk_start = (lower.starts_with("constraint")
+            && (lower.contains("foreign key") || lower.contains("references")))
+            || (lower.starts_with("foreign key")
+                && (lower.contains("references") || lower.contains('(')));
 
         if is_fk_start {
             if let Some(name) = extract_constraint_name(trimmed) {
@@ -272,7 +277,10 @@ fn strip_foreign_keys(ddl: &str) -> (String, Vec<String>) {
     }
 
     // 若最后一条有效数据行以逗号结尾但后面已无内容，去掉该逗号。
-    if let Some(close_idx) = out_lines.iter().rposition(|l| l.trim_start().starts_with(')')) {
+    if let Some(close_idx) = out_lines
+        .iter()
+        .rposition(|l| l.trim_start().starts_with(')'))
+    {
         if close_idx > 0 {
             let prev = out_lines[close_idx - 1].trim_end();
             if prev.ends_with(',') {
@@ -382,7 +390,9 @@ mod tests {
         let r = rewrite_create_table(SAMPLE, &opts());
         assert!(!r.ddl.contains("AUTO_INCREMENT=12345"), "{}", r.ddl);
         // 列定义里的 AUTO_INCREMENT 必须保留
-        assert!(r.ddl.contains("`id` bigint unsigned NOT NULL AUTO_INCREMENT"));
+        assert!(r
+            .ddl
+            .contains("`id` bigint unsigned NOT NULL AUTO_INCREMENT"));
     }
 
     #[test]

@@ -55,7 +55,16 @@ impl ConnConfig {
 
     /// 用于日志/UI 显示的脱敏标识。
     pub fn display(&self) -> String {
-        format!("{}@{}{}", self.username, self.host, if self.port != 3306 { format!(":{}", self.port) } else { String::new() })
+        format!(
+            "{}@{}{}",
+            self.username,
+            self.host,
+            if self.port != 3306 {
+                format!(":{}", self.port)
+            } else {
+                String::new()
+            }
+        )
     }
 }
 
@@ -100,7 +109,7 @@ pub enum WriteMode {
 }
 
 /// 单表同步配置。
-#[derive(Debug, Clone, Deserialize, Serialize)]
+#[derive(Debug, Clone, Deserialize, Serialize, Default)]
 pub struct TableTaskConfig {
     pub table: String,
     /// 源库名
@@ -126,9 +135,34 @@ pub struct TableTaskConfig {
     /// 本表是否在同步前清空目标表；None 表示跟随全局 TaskOptions
     #[serde(default)]
     pub truncate_target: Option<bool>,
+    /// 本表在目标不存在时是否自动建表；None 表示跟随全局 TaskOptions
+    #[serde(default)]
+    pub create_table: Option<bool>,
+    /// 本表建表时是否剥离外键约束；None 表示跟随全局 TaskOptions
+    #[serde(default)]
+    pub strip_foreign_keys: Option<bool>,
+    /// 本表建表时是否移除 AUTO_INCREMENT；None 表示跟随全局 TaskOptions
+    #[serde(default)]
+    pub strip_auto_increment: Option<bool>,
+    /// 本表建表时是否降级 collation；None 表示跟随全局 TaskOptions
+    #[serde(default)]
+    pub map_collation: Option<bool>,
+    /// 本表同步出错时是否跳过并继续其它表；None 表示跟随全局 TaskOptions
+    #[serde(default)]
+    pub continue_on_error: Option<bool>,
+    /// 其他字段条件过滤（SQL WHERE 表达式，如 `status = 1 AND is_deleted = 0`）
+    #[serde(default)]
+    pub filter: Option<String>,
 }
 
 impl TableTaskConfig {
+    /// 解析本表实际生效的其他字段过滤条件。
+    pub fn effective_filter(&self) -> Option<String> {
+        self.filter
+            .as_ref()
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+    }
     /// 解析本表实际生效的游标模式：表级优先，其次全局。
     pub fn effective_cursor_start(&self, global: &TaskOptions) -> CursorStart {
         self.cursor_start.unwrap_or(global.cursor_start)
@@ -139,9 +173,7 @@ impl TableTaskConfig {
     /// 表级显式设了就用表级（包括设成空串表示「不限」）；
     /// 否则回落到全局。返回 owned 值是为了避开两个来源的生命周期纠缠。
     pub fn effective_start_id(&self, global: &TaskOptions) -> Option<String> {
-        self.start_id
-            .clone()
-            .or_else(|| global.start_id.clone())
+        self.start_id.clone().or_else(|| global.start_id.clone())
     }
 
     /// 解析本表实际生效的结束 id。
@@ -152,6 +184,44 @@ impl TableTaskConfig {
     /// 解析本表实际生效的 truncate 策略：表级优先，其次全局。
     pub fn effective_truncate_target(&self, global: &TaskOptions) -> bool {
         self.truncate_target.unwrap_or(global.truncate_target)
+    }
+
+    /// 解析本表实际生效的自动建表策略：表级优先，其次全局。
+    pub fn effective_create_table(&self, global: &TaskOptions) -> bool {
+        self.create_table.unwrap_or(global.create_table)
+    }
+
+    /// 解析本表实际生效的剥离外键策略：表级优先，其次全局。
+    pub fn effective_strip_foreign_keys(&self, global: &TaskOptions) -> bool {
+        self.strip_foreign_keys.unwrap_or(global.strip_foreign_keys)
+    }
+
+    /// 解析本表实际生效的剥离自增策略：表级优先，其次全局。
+    pub fn effective_strip_auto_increment(&self, global: &TaskOptions) -> bool {
+        self.strip_auto_increment
+            .unwrap_or(global.strip_auto_increment)
+    }
+
+    /// 解析本表实际生效的降级 collation 策略：表级优先，其次全局。
+    pub fn effective_map_collation(&self, global: &TaskOptions) -> bool {
+        self.map_collation.unwrap_or(global.map_collation)
+    }
+
+    /// 解析本表实际生效的出错继续策略：表级优先，其次全局。
+    pub fn effective_continue_on_error(&self, global: &TaskOptions) -> bool {
+        self.continue_on_error.unwrap_or(global.continue_on_error)
+    }
+
+    /// 是否有表级覆盖设置。
+    pub fn has_overrides(&self) -> bool {
+        self.has_cursor_override()
+            || self.truncate_target.is_some()
+            || self.create_table.is_some()
+            || self.strip_foreign_keys.is_some()
+            || self.strip_auto_increment.is_some()
+            || self.map_collation.is_some()
+            || self.continue_on_error.is_some()
+            || self.dst_table.is_some()
     }
 
     /// 是否有表级游标覆盖。
@@ -276,13 +346,12 @@ impl Default for TaskOptions {
     }
 }
 
-
-    #[test]
-    fn batch_size_default_is_1000() {
-        // 引擎靠这个值判断「用户有没有动过批大小」，
-        // 改了默认值这里必须同步更新。
-        assert_eq!(default_batch_size(), 1000);
-    }
+#[test]
+fn batch_size_default_is_1000() {
+    // 引擎靠这个值判断「用户有没有动过批大小」，
+    // 改了默认值这里必须同步更新。
+    assert_eq!(default_batch_size(), 1000);
+}
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -317,7 +386,12 @@ mod tests {
         assert_eq!(url.db_name(), Some("db_a"));
     }
 
-    fn task(table: &str, cs: Option<CursorStart>, start: Option<&str>, end: Option<&str>) -> TableTaskConfig {
+    fn task(
+        table: &str,
+        cs: Option<CursorStart>,
+        start: Option<&str>,
+        end: Option<&str>,
+    ) -> TableTaskConfig {
         TableTaskConfig {
             table: table.into(),
             src_schema: "db_a".into(),
@@ -328,6 +402,12 @@ mod tests {
             start_id: start.map(|s| s.to_string()),
             end_id: end.map(|s| s.to_string()),
             truncate_target: None,
+            create_table: None,
+            continue_on_error: None,
+            strip_auto_increment: None,
+            strip_foreign_keys: None,
+            map_collation: None,
+            filter: None,
         }
     }
 

@@ -33,16 +33,32 @@ pub struct Check {
 
 impl Check {
     fn error(code: &str, message: impl Into<String>) -> Self {
-        Self { severity: Severity::Error, code: code.into(), message: message.into() }
+        Self {
+            severity: Severity::Error,
+            code: code.into(),
+            message: message.into(),
+        }
     }
     fn warn(code: &str, message: impl Into<String>) -> Self {
-        Self { severity: Severity::Warning, code: code.into(), message: message.into() }
+        Self {
+            severity: Severity::Warning,
+            code: code.into(),
+            message: message.into(),
+        }
     }
     fn info(code: &str, message: impl Into<String>) -> Self {
-        Self { severity: Severity::Info, code: code.into(), message: message.into() }
+        Self {
+            severity: Severity::Info,
+            code: code.into(),
+            message: message.into(),
+        }
     }
     fn ok(code: &str, message: impl Into<String>) -> Self {
-        Self { severity: Severity::Ok, code: code.into(), message: message.into() }
+        Self {
+            severity: Severity::Ok,
+            code: code.into(),
+            message: message.into(),
+        }
     }
 }
 
@@ -67,8 +83,12 @@ pub struct TablePreflight {
     pub source_max_pk: Option<String>,
     pub target_max_pk: Option<String>,
     pub source_rows_estimate: u64,
-    /// 本次同步预计处理的行数（综合考量自定义游标区间、断点续传已有最大主键与源表行数估算）
+    /// 本次同步预计处理的行数（综合考量自定义游标区间、断点续传已有最大主键、
+    /// 表级 WHERE 过滤条件与源表真实行数）
     pub planned_rows: u64,
+    /// planned_rows 是否为源库精确统计（COUNT(*)）的结果；false 表示退化为区间估算
+    #[serde(default)]
+    pub planned_rows_exact: bool,
     pub target_rows_exists: bool,
     /// 目标表缺失列时生成的 ALTER TABLE 语句列表（用于先同步结构）
     #[serde(default)]
@@ -79,6 +99,9 @@ pub struct TablePreflight {
     pub start_id: Option<String>,
     /// 本表生效的结束 id
     pub end_id: Option<String>,
+    /// 本表生效的其他字段条件过滤（SQL WHERE 表达式）
+    #[serde(default)]
+    pub filter: Option<String>,
 }
 
 impl TablePreflight {
@@ -110,7 +133,9 @@ impl PreflightReport {
 
     /// 是否存在需要同步的表结构（包含缺失表新建或已有表补全列）
     pub fn has_schema_changes(&self) -> bool {
-        self.tables.iter().any(|t| t.needs_create_table || !t.alter_sqls.is_empty())
+        self.tables
+            .iter()
+            .any(|t| t.needs_create_table || !t.alter_sqls.is_empty())
     }
 }
 
@@ -150,9 +175,23 @@ pub async fn run(
         ));
     }
 
+    let src_is_mariadb = introspect::is_mariadb(src).await?;
+
     let mut tables = Vec::with_capacity(tasks.len());
     for task in tasks {
-        tables.push(check_table(src, dst, task, options, dst_ver, dst_is_mariadb).await?);
+        tables.push(
+            check_table(
+                src,
+                dst,
+                task,
+                options,
+                dst_ver,
+                dst_is_mariadb,
+                src_is_mariadb,
+                same_conn,
+            )
+            .await?,
+        );
     }
 
     Ok(PreflightReport {
@@ -171,9 +210,25 @@ async fn check_table(
     options: &crate::config::TaskOptions,
     dst_ver: (u16, u16, u16),
     dst_is_mariadb: bool,
+    src_is_mariadb: bool,
+    same_conn: bool,
 ) -> Result<TablePreflight> {
     let mut checks = Vec::new();
     let dst_table_name = task.dst_table_name().to_string();
+
+    // ---- 同物理表检测（同一实例 + 同库 + 同表）----
+    if same_conn
+        && task.src_schema.eq_ignore_ascii_case(&task.dst_schema)
+        && task.table.eq_ignore_ascii_case(&dst_table_name)
+    {
+        checks.push(Check::error(
+            "same_source_target_table",
+            format!(
+                "源表与目标表指向同一物理表（{}.{}），禁止对自己同步",
+                task.src_schema, task.table
+            ),
+        ));
+    }
 
     // ---- 源表 ----
     let src_detail = introspect::table_detail(src, &task.src_schema, &task.table).await?;
@@ -202,18 +257,23 @@ async fn check_table(
     let mut needs_create_table: bool = false;
     let mut create_table: Option<RewriteResult> = None;
 
+    let eff_create_table = task.effective_create_table(options);
+    let eff_strip_ai = task.effective_strip_auto_increment(options);
+    let eff_strip_fk = task.effective_strip_foreign_keys(options);
+    let eff_map_collation = task.effective_map_collation(options);
+
     if !target_rows_exists {
         needs_create_table = true;
-        if options.create_table {
+        if eff_create_table {
             let ddl = introspect::show_create_table(src, &task.src_schema, &task.table).await?;
             let rewritten = rewrite_create_table(
                 &ddl,
                 &RewriteOptions {
                     dst_schema: task.dst_schema.clone(),
                     dst_table: dst_table_name.clone(),
-                    strip_auto_increment: options.strip_auto_increment,
-                    strip_foreign_keys: options.strip_foreign_keys,
-                    map_collation: options.map_collation,
+                    strip_auto_increment: eff_strip_ai,
+                    strip_foreign_keys: eff_strip_fk,
+                    map_collation: eff_map_collation,
                     target_version: dst_ver,
                     target_is_mariadb: dst_is_mariadb,
                 },
@@ -364,7 +424,7 @@ async fn check_table(
         None
     };
 
-    if !options.strip_foreign_keys && needs_create_table && syncable_pk {
+    if !eff_strip_fk && needs_create_table && syncable_pk {
         checks.push(Check::warn(
             "fk_kept",
             "建表时保留了外键约束，若被引用表尚未创建会建表失败",
@@ -384,9 +444,8 @@ async fn check_table(
         ));
     }
 
-    let syncable = syncable_pk
-        && !checks.iter().any(|c| c.severity == Severity::Error)
-        && !columns.is_empty();
+    let syncable =
+        syncable_pk && !checks.iter().any(|c| c.severity == Severity::Error) && !columns.is_empty();
 
     // 不可同步的表不展示建表方案，避免误导用户以为它会被创建。
     if !syncable {
@@ -411,6 +470,7 @@ async fn check_table(
     let end_id = task
         .effective_end_id(options)
         .filter(|s| !s.trim().is_empty());
+    let filter = task.effective_filter();
 
     // 自定义游标填错了会静默同步 0 行，这里提前点破。
     if cursor_start == crate::config::CursorStart::Custom {
@@ -420,8 +480,16 @@ async fn check_table(
                 "选了自定义游标但没填起始 id，将等同全量",
             )),
             Some(v) => {
+                if v.parse::<i128>().is_err() {
+                    checks.push(Check::error(
+                        "cursor_invalid",
+                        format!("起始 id `{v}` 不是合法整数，任务将直接失败"),
+                    ));
+                }
                 if let Ok(maxv) = v.parse::<i128>() {
-                    if let Some(src_max) = source_max_pk.as_ref().and_then(|m| m.parse::<i128>().ok()) {
+                    if let Some(src_max) =
+                        source_max_pk.as_ref().and_then(|m| m.parse::<i128>().ok())
+                    {
                         if maxv > src_max {
                             checks.push(Check::error(
                                 "cursor_beyond_max",
@@ -444,14 +512,79 @@ async fn check_table(
         }
     }
 
-    let planned_rows = estimate_planned_rows(
+    if let Some(v) = &end_id {
+        if v.parse::<i128>().is_err() {
+            checks.push(Check::error(
+                "cursor_end_invalid",
+                format!("结束 id `{v}` 不是合法整数，任务将直接失败"),
+            ));
+        }
+    }
+
+    // ---- 预计行数 ----
+    //
+    // 光看 information_schema.TABLES.TABLE_ROWS 和主键区间会严重高估：
+    // 表级 WHERE 过滤、主键空洞、断点续跑已经同步过的部分全都没算进去。
+    // 用户给 inventory_lists 填了软删除过滤后，估算给出 128.4 万，实际只有个位数。
+    // 所以这里按「与引擎完全一致」的 WHERE 条件去源库做一次 COUNT(*)，
+    // 统计失败或超时才回落到区间估算。
+    let estimate = estimate_planned_rows(
         src_rows_estimate,
         source_max_pk.as_deref(),
-        if will_truncate { None } else { target_max_pk.as_deref() },
+        if will_truncate {
+            None
+        } else {
+            target_max_pk.as_deref()
+        },
         cursor_start,
         start_id.as_deref(),
         end_id.as_deref(),
     );
+
+    let mut planned_rows = estimate;
+    let mut planned_rows_exact = false;
+    // 大表上的 COUNT(*) 可能几十秒，而预检是串行跑几百张表的。
+    // 无过滤、无区间、且表本身很小的场景才顺手统计；其余大表的全量同步丢掉
+    // 精确性也无所谓（TABLE_ROWS 估算通常误差 < 10%）。
+    let narrow_scope = filter.is_some() || start_id.is_some() || end_id.is_some();
+    let worth_counting = narrow_scope || src_rows_estimate <= COUNT_ESTIMATE_ONLY_ABOVE;
+
+    if worth_counting {
+        if let (true, Some(pk)) = (syncable, pk_name.as_deref()) {
+            let count = count_planned_rows(
+                src,
+                &task.src_schema,
+                &task.table,
+                pk,
+                pk_unsigned,
+                cursor_start,
+                start_id.as_deref(),
+                end_id.as_deref(),
+                if will_truncate {
+                    None
+                } else {
+                    target_max_pk.as_deref()
+                },
+                filter.as_deref(),
+                src_is_mariadb,
+            )
+            .await;
+            match count {
+                Ok(Some(n)) => {
+                    planned_rows = n;
+                    planned_rows_exact = true;
+                }
+                Ok(None) => checks.push(Check::warn(
+                    "rows_count_timeout",
+                    format!("精确行数统计超时，预计行数已回落到区间估算（{estimate} 行）"),
+                )),
+                Err(e) => checks.push(Check::warn(
+                    "rows_count_failed",
+                    format!("精确行数统计失败（{e}），预计行数已回落到区间估算（{estimate} 行）"),
+                )),
+            }
+        }
+    }
 
     Ok(TablePreflight {
         source_schema: task.src_schema.clone(),
@@ -469,11 +602,13 @@ async fn check_table(
         target_max_pk,
         source_rows_estimate: src_rows_estimate,
         planned_rows,
+        planned_rows_exact,
         target_rows_exists,
         alter_sqls,
         cursor_start,
         start_id,
         end_id,
+        filter: task.effective_filter(),
     })
 }
 
@@ -643,7 +778,11 @@ fn compare_columns(
             continue;
         };
         let Some(d) = dst.columns.iter().find(|c| &c.name == name) else {
-            let src_idx = src.columns.iter().position(|c| &c.name == name).unwrap_or(0);
+            let src_idx = src
+                .columns
+                .iter()
+                .position(|c| &c.name == name)
+                .unwrap_or(0);
             let after_col = if src_idx > 0 {
                 src.columns[..src_idx]
                     .iter()
@@ -728,6 +867,149 @@ fn split_type(ty: &str) -> (String, Option<u64>) {
             (base, num)
         }
         None => (ty.to_string(), None),
+    }
+}
+
+/// 预检精确计数时给源库设置的语句超时（毫秒）。
+/// 大表 COUNT(*) 可能很慢，但预检不能把界面钡死。
+const COUNT_TIMEOUT_MS: u64 = 5_000;
+
+/// 无过滤、无区间时，表估算行数超过这个值就不再做精确 COUNT(*)。
+/// 预检是串行跑的，几百张大表逐张 COUNT 会把用户干等出一个假死界面。
+const COUNT_ESTIMATE_ONLY_ABOVE: u64 = 2_000_000;
+
+/// 给当前会话设置语句超时；返回 false 表示服务器不支持该变量（如 MySQL 5.6）。
+async fn apply_stmt_timeout(conn: &mut mysql_async::Conn, is_mariadb: bool, ms: u64) -> bool {
+    use mysql_async::prelude::*;
+    let sql = if is_mariadb {
+        // MariaDB: max_statement_time 单位是秒，0 表示不限
+        format!("SET SESSION max_statement_time = {}", ms as f64 / 1000.0)
+    } else {
+        // MySQL 5.7.8+: max_execution_time 单位是毫秒，0 表示不限
+        format!("SET SESSION max_execution_time = {ms}")
+    };
+    conn.query_drop(sql).await.is_ok()
+}
+
+/// 构造与同步引擎完全一致的计数条件（拆出来是为了单测）。
+/// 开区间/闭区间语义必须和 `engine::sync_one` 对齐：
+/// - 自定义起始 ID 为闭区间 `>=`
+/// - 全量 / 续跑为开区间 `>`
+/// - 结束 ID 一律 `<=`
+fn build_count_sql(
+    schema: &str,
+    table: &str,
+    pk: &str,
+    cursor_start: crate::config::CursorStart,
+    start: Option<mysql_async::Value>,
+    end: Option<mysql_async::Value>,
+    filter: Option<&str>,
+) -> (String, Vec<mysql_async::Value>) {
+    use crate::config::CursorStart;
+
+    let pkq = crate::value::quote_ident(pk);
+    let mut conds: Vec<String> = Vec::new();
+    let mut params: Vec<mysql_async::Value> = Vec::new();
+
+    let start_op = match cursor_start {
+        CursorStart::Full => None,
+        CursorStart::Resume => Some(">"),
+        CursorStart::Custom => Some(">="),
+    };
+    if let (Some(op), Some(v)) = (start_op, start) {
+        conds.push(format!("{pkq} {op} ?"));
+        params.push(v);
+    }
+    if let Some(v) = end {
+        conds.push(format!("{pkq} <= ?"));
+        params.push(v);
+    }
+    if let Some(f) = filter {
+        let f = f.trim();
+        if !f.is_empty() {
+            conds.push(format!("({f})"));
+        }
+    }
+
+    let where_clause = if conds.is_empty() {
+        String::new()
+    } else {
+        format!(" WHERE {}", conds.join(" AND "))
+    };
+    (
+        format!(
+            "SELECT COUNT(*) FROM {}{where_clause}",
+            qualified(schema, table)
+        ),
+        params,
+    )
+}
+
+/// 在源库精确统计本次任务实际会同步的行数。
+///
+/// - `Ok(Some(n))`：统计成功
+/// - `Ok(None)`：语句超时，调用方应回落到区间估算
+/// - `Err(_)`：统计失败（例如过滤条件语法错），调用方同样回落
+async fn count_planned_rows(
+    src: &mut mysql_async::Conn,
+    schema: &str,
+    table: &str,
+    pk: &str,
+    pk_unsigned: bool,
+    cursor_start: crate::config::CursorStart,
+    start_id: Option<&str>,
+    end_id: Option<&str>,
+    target_max_pk: Option<&str>,
+    filter: Option<&str>,
+    src_is_mariadb: bool,
+) -> Result<Option<u64>> {
+    use mysql_async::prelude::*;
+
+    // 起始值：全量没有起点；续跑取目标表已有 MAX(pk)；自定义取用户填的值。
+    let start_raw = match cursor_start {
+        crate::config::CursorStart::Full => None,
+        crate::config::CursorStart::Resume => target_max_pk,
+        crate::config::CursorStart::Custom => start_id,
+    };
+    let start = match start_raw {
+        Some(v) => Some(crate::value::parse_cursor_value(v, pk_unsigned)?),
+        None => None,
+    };
+    let end = match end_id {
+        Some(v) => Some(crate::value::parse_cursor_value(v, pk_unsigned)?),
+        None => None,
+    };
+
+    let (sql, params) = build_count_sql(schema, table, pk, cursor_start, start, end, filter);
+
+    // 能设超时就设，设不上（老版本 MySQL）也照样统计，只是没了保险。
+    let timeout_on = apply_stmt_timeout(src, src_is_mariadb, COUNT_TIMEOUT_MS).await;
+    let out: std::result::Result<Option<(u64,)>, crate::Error> = src
+        .exec_first(sql, mysql_async::Params::Positional(params))
+        .await
+        .map_err(Into::into);
+    if timeout_on {
+        apply_stmt_timeout(src, src_is_mariadb, 0).await;
+    }
+
+    match out {
+        Ok(Some((n,))) => Ok(Some(n)),
+        Ok(None) => Ok(Some(0)),
+        Err(crate::Error::MySql { code, message, .. }) => {
+            // 3024 = MySQL ER_QUERY_TIMEOUT；1969 = MariaDB ER_STATEMENT_TIMEOUT；1317 = 查询被中断
+            if matches!(code, 3024 | 1969 | 1317)
+                || message.to_ascii_lowercase().contains("timeout")
+            {
+                Ok(None)
+            } else {
+                Err(crate::Error::MySql {
+                    code,
+                    state: String::new(),
+                    message,
+                })
+            }
+        }
+        Err(e) => Err(e),
     }
 }
 
@@ -829,6 +1111,50 @@ mod tests {
     }
 
     #[test]
+    fn count_sql_mirrors_engine_bounds() {
+        use crate::config::CursorStart;
+        use mysql_async::Value;
+
+        // 自定义游标：闭区间 [start, end]，过滤条件必须包在括号里
+        let (sql, params) = build_count_sql(
+            "fbb",
+            "inventory_lists",
+            "id",
+            CursorStart::Custom,
+            Some(Value::Int(511_500_000)),
+            Some(Value::Int(570_760_598)),
+            Some("`deleted_at` IS NULL"),
+        );
+        assert_eq!(
+            sql,
+            "SELECT COUNT(*) FROM `fbb`.`inventory_lists` WHERE `id` >= ? AND `id` <= ? AND (`deleted_at` IS NULL)"
+        );
+        assert_eq!(params.len(), 2);
+
+        // 全量：没有起始游标，开区间
+        let (sql, params) = build_count_sql("s", "t", "id", CursorStart::Full, None, None, None);
+        assert_eq!(sql, "SELECT COUNT(*) FROM `s`.`t`");
+        assert!(params.is_empty());
+
+        // 续跑：目标已有 MAX(pk)，开区间 >（与引擎一致，不含已同步那一行）
+        let (sql, params) = build_count_sql(
+            "s",
+            "t",
+            "id",
+            CursorStart::Resume,
+            Some(Value::Int(800)),
+            None,
+            None,
+        );
+        assert_eq!(sql, "SELECT COUNT(*) FROM `s`.`t` WHERE `id` > ?");
+        assert_eq!(params.len(), 1);
+
+        // 空白过滤条件不应拼出 `()` 这种语法错
+        let (sql, _) = build_count_sql("s", "t", "id", CursorStart::Full, None, None, Some("   "));
+        assert_eq!(sql, "SELECT COUNT(*) FROM `s`.`t`");
+    }
+
+    #[test]
     fn splits_types() {
         assert_eq!(split_type("varchar(64)"), ("varchar".into(), Some(64)));
         assert_eq!(split_type("int"), ("int".into(), None));
@@ -926,5 +1252,36 @@ mod tests {
         assert_eq!(alter_sqls.len(), 1);
         assert!(alter_sqls[0].contains("ADD COLUMN `age` int"));
         assert!(alter_sqls[0].contains("AFTER `name`"));
+    }
+
+    #[test]
+    fn test_same_instance_detection() {
+        use crate::config::ConnConfig;
+        let c1 = ConnConfig {
+            host: "127.0.0.1".into(),
+            port: 3306,
+            username: "root".into(),
+            password: "123".into(),
+            schema: None,
+            use_tls: false,
+        };
+        let c2 = ConnConfig {
+            host: "127.0.0.1".into(),
+            port: 3306,
+            username: "root".into(),
+            password: "456".into(),
+            schema: None,
+            use_tls: false,
+        };
+        let c3 = ConnConfig {
+            host: "127.0.0.1".into(),
+            port: 3307,
+            username: "root".into(),
+            password: "123".into(),
+            schema: None,
+            use_tls: false,
+        };
+        assert!(same_instance(&c1, &c2));
+        assert!(!same_instance(&c1, &c3));
     }
 }
