@@ -1414,7 +1414,7 @@ impl RowBridgeApp {
             let tid = tid.clone();
             let _ = this.update(cx, |this, cx| {
                 if let Some(task) = this.tasks.iter_mut().find(|t| t.id == tid) {
-                    let finish = |task: &SyncTask, error: Option<&str>| {
+                    let finish = |task: &SyncTask, error: Option<&str>, elapsed_ms: u64| {
                         let total: u64 = task.progress.values().map(|p| p.rows).sum();
                         let done: usize = task
                             .progress
@@ -1432,7 +1432,7 @@ impl RowBridgeApp {
                             total,
                             done,
                             failed_t,
-                            0,
+                            elapsed_ms,
                             now_ms(),
                             error,
                         )
@@ -1461,7 +1461,7 @@ impl RowBridgeApp {
                                 table: None,
                                 message: msg.into(),
                             });
-                            finish(task, None);
+                            finish(task, None, r.elapsed_ms);
                         }
                         Ok(Err(e)) => {
                             task.status = TaskStatus::Failed;
@@ -1472,12 +1472,12 @@ impl RowBridgeApp {
                                 table: None,
                                 message: format!("任务失败：{e}").into(),
                             });
-                            finish(task, Some(e));
+                            finish(task, Some(e), 0);
                         }
                         Err(e) => {
                             task.status = TaskStatus::Failed;
                             task.error = Some(e.to_string());
-                            finish(task, Some(&task.error.clone().unwrap_or_default()));
+                            finish(task, Some(&task.error.clone().unwrap_or_default()), 0);
                         }
                     }
                 }
@@ -1672,6 +1672,35 @@ impl RowBridgeApp {
             store::remove_task(id).unwrap_or_else(|e| eprintln!("[store] 删除任务记录失败：{e}"));
             if self.selected_task_id.as_deref() == Some(id) {
                 self.selected_task_id = self.tasks.first().map(|t| t.id.clone());
+            }
+        }
+    }
+
+    /// 选中历史任务时按需加载它的日志（内存里没有就跑一次 SQLite）。
+    pub(crate) fn load_task_logs(&mut self, id: &str) {
+        let Some(task) = self.tasks.iter_mut().find(|t| t.id == id) else {
+            return;
+        };
+        if !task.logs.is_empty() || task.is_active() {
+            return;
+        }
+        match store::task_logs(id, 500) {
+            Ok(rows) => {
+                task.logs = rows
+                    .into_iter()
+                    .map(|r| TaskLogEntry {
+                        time: chrono::DateTime::from_timestamp(r.ts / 1000, 0)
+                            .map(|t| t.format("%H:%M:%S").to_string())
+                            .unwrap_or_default()
+                            .into(),
+                        level: r.level.into(),
+                        table: r.table_name,
+                        message: r.message.into(),
+                    })
+                    .collect();
+            }
+            Err(e) => {
+                eprintln!("[store] 加载任务日志失败：{e}");
             }
         }
     }

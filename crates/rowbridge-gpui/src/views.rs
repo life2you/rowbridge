@@ -771,6 +771,7 @@ impl RowBridgeApp {
                         let id = id.clone();
                         move |this, _, _, cx| {
                             this.selected_task_id = Some(id.clone());
+                            this.load_task_logs(&id);
                             cx.notify();
                         }
                     }));

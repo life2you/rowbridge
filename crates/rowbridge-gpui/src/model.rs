@@ -495,6 +495,31 @@ impl SyncTask {
         let dst_name = dst.clone();
         let (src_ep, src_schema) = split_endpoint(&src);
         let (dst_ep, dst_schema) = split_endpoint(&dst);
+        // 历史日志直接带上：任务卡片在左侧点开就能看到上次的日志
+        let logs = rowbridge_core::store::task_logs(&id, 500)
+            .unwrap_or_default()
+            .into_iter()
+            .map(|r| TaskLogEntry {
+                time: chrono::DateTime::from_timestamp(r.ts / 1000, 0)
+                    .map(|t| t.format("%H:%M:%S").to_string())
+                    .unwrap_or_default()
+                    .into(),
+                level: r.level.into(),
+                table: r.table_name,
+                message: r.message.into(),
+            })
+            .collect();
+        // 历史库里没有逐表进度，只有总行数：合成一条伪表进度，
+        // 让卡片展示「x/y 行 · 1/1 表」而不是误导性的 0/0。
+        let mut progress = HashMap::new();
+        let mut tables = Vec::new();
+        if _total_rows > 0 {
+            let mut p = TableProgress::pending(_total_rows);
+            p.rows = _total_rows;
+            p.status = "done";
+            progress.insert("（全部表）".to_string(), p);
+            tables.push("（全部表）".to_string());
+        }
         SyncTask {
             name: format!("{src_schema} → {dst_schema}"),
             created_at,
@@ -504,12 +529,12 @@ impl SyncTask {
             dst_ep: dst_ep.to_string(),
             src_schema: src_schema.to_string(),
             dst_schema: dst_schema.to_string(),
-            tables: Vec::new(),
+            tables,
             status: TaskStatus::from_store_key(status),
             cancel: CancellationToken::new(),
             pause: rowbridge_core::engine::PauseController::new(),
-            progress: HashMap::new(),
-            logs: Vec::new(),
+            progress,
+            logs,
             error,
             id,
         }
