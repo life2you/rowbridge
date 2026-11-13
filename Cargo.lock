@@ -6753,7 +6753,7 @@ dependencies = [
 
 [[package]]
 name = "rowbridge"
-version = "0.7.2"
+version = "0.7.3"
 dependencies = [
  "mysql_async",
  "rowbridge-core",
@@ -6770,7 +6770,7 @@ dependencies = [
 
 [[package]]
 name = "rowbridge-core"
-version = "0.7.2"
+version = "0.7.3"
 dependencies = [
  "clap",
  "futures-util",
@@ -6785,7 +6785,7 @@ dependencies = [
 
 [[package]]
 name = "rowbridge-gpui"
-version = "0.7.2"
+version = "0.7.3"
 dependencies = [
  "chrono",
  "gpui-kit",
