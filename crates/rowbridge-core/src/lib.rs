@@ -18,6 +18,7 @@ pub mod engine;
 pub mod error;
 pub mod introspect;
 pub mod preflight;
+pub mod store;
 pub mod value;
 
 pub use error::{Error, Result};

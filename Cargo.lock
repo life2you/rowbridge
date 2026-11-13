@@ -6775,6 +6775,7 @@ dependencies = [
  "clap",
  "futures-util",
  "mysql_async",
+ "rusqlite",
  "serde",
  "serde_json",
  "thiserror 2.0.21",

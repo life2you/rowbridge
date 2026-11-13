@@ -10,6 +10,7 @@ use rowbridge_core::connections::{self, SavedConnection};
 use rowbridge_core::engine::Event;
 use rowbridge_core::introspect::{ColumnInfo, SchemaInfo};
 use rowbridge_core::preflight::PreflightReport;
+use rowbridge_core::store;
 use tokio_util::sync::CancellationToken;
 
 use crate::model::*;
@@ -84,6 +85,8 @@ impl RowBridgeApp {
     pub fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
         let _ = connections::init();
         let saved = connections::list().unwrap_or_default();
+        let _ = store::init();
+        let tasks = Self::load_history_tasks();
 
         let src = ConnPanel::new("用户名", window, cx);
         let dst = ConnPanel::new("用户名", window, cx);
@@ -174,7 +177,7 @@ impl RowBridgeApp {
             loading_ed_columns: false,
             table_columns_cache: HashMap::new(),
             table_list_scroll: UniformListScrollHandle::new(),
-            tasks: Vec::new(),
+            tasks,
             selected_task_id: None,
             report: None,
             preflighting: false,
@@ -1337,6 +1340,8 @@ impl RowBridgeApp {
             message: format!("开始同步 {} 张表", table_names.len()).into(),
         };
 
+        let store_src = format!("{src_ep}/{src_schema}");
+        let store_dst = format!("{dst_ep}/{dst_schema}");
         let task = SyncTask {
             id: task_id.clone(),
             name: task_name,
@@ -1358,6 +1363,8 @@ impl RowBridgeApp {
 
         self.tasks.insert(0, task);
         self.selected_task_id = Some(task_id.clone());
+        store::record_task_start(&task_id, &store_src, &store_dst, "running", now_ms())
+            .unwrap_or_else(|e| eprintln!("[store] 任务落库失败：{e}"));
 
         let handle = ops::start_sync(cfg, report.clone(), cancel, pause);
         self.status = Some((true, "已加入同步任务，可继续添加".into()));
@@ -1377,6 +1384,8 @@ impl RowBridgeApp {
             let mut last_notify = std::time::Instant::now()
                 .checked_sub(std::time::Duration::from_secs(1))
                 .unwrap_or_else(std::time::Instant::now);
+            let mut persisted_logs: usize = 0;
+            let mut last_persist = std::time::Instant::now();
             while let Some(ev) = events.recv().await {
                 let tid = tid.clone();
                 let is_batch = matches!(ev, Event::BatchDone { .. });
@@ -1388,6 +1397,12 @@ impl RowBridgeApp {
                 let _ = this.update(cx, |this, cx| {
                     if let Some(task) = this.tasks.iter_mut().find(|t| t.id == tid) {
                         Self::apply_task_event(task, &ev);
+                        Self::persist_task_event(
+                            &tid,
+                            &task.logs,
+                            &mut persisted_logs,
+                            &mut last_persist,
+                        );
                     }
                     this.on_event(ev);
                     if should_notify {
@@ -1399,6 +1414,30 @@ impl RowBridgeApp {
             let tid = tid.clone();
             let _ = this.update(cx, |this, cx| {
                 if let Some(task) = this.tasks.iter_mut().find(|t| t.id == tid) {
+                    let finish = |task: &SyncTask, error: Option<&str>| {
+                        let total: u64 = task.progress.values().map(|p| p.rows).sum();
+                        let done: usize = task
+                            .progress
+                            .values()
+                            .filter(|p| p.status == "done")
+                            .count();
+                        let failed_t: usize = task
+                            .progress
+                            .values()
+                            .filter(|p| p.status == "failed")
+                            .count();
+                        store::record_task_finish(
+                            &task.id,
+                            task.status.store_key(),
+                            total,
+                            done,
+                            failed_t,
+                            0,
+                            now_ms(),
+                            error,
+                        )
+                        .unwrap_or_else(|e| eprintln!("[store] 任务状态落库失败：{e}"));
+                    };
                     match &result {
                         Ok(Ok(r)) => {
                             task.status = if r.cancelled {
@@ -1422,6 +1461,7 @@ impl RowBridgeApp {
                                 table: None,
                                 message: msg.into(),
                             });
+                            finish(task, None);
                         }
                         Ok(Err(e)) => {
                             task.status = TaskStatus::Failed;
@@ -1432,10 +1472,12 @@ impl RowBridgeApp {
                                 table: None,
                                 message: format!("任务失败：{e}").into(),
                             });
+                            finish(task, Some(e));
                         }
                         Err(e) => {
                             task.status = TaskStatus::Failed;
                             task.error = Some(e.to_string());
+                            finish(task, Some(&task.error.clone().unwrap_or_default()));
                         }
                     }
                 }
@@ -1543,6 +1585,36 @@ impl RowBridgeApp {
         }
     }
 
+    /// 把任务里「还没落库」的日志增量写进 SQLite。
+    /// 增量由 `last_persist` 记录：GPUI 主线程串行调用，闭包拿到的 idx 是快照。
+    fn persist_task_event(
+        tid: &str,
+        logs: &[TaskLogEntry],
+        persisted: &mut usize,
+        last_persist: &mut std::time::Instant,
+    ) {
+        // 日志太频繁：前两条（任务开始类）不落；之后按节流批量追加，
+        // 避免拖慢高频 BatchDone 的 UI 刷新。
+        let start = (*persisted).max(2).min(logs.len());
+        if start >= logs.len() {
+            return;
+        }
+        if last_persist.elapsed() < std::time::Duration::from_millis(1500) && logs.len() <= 500 {
+            return;
+        }
+        for entry in &logs[start..] {
+            let _ = store::append_log(
+                tid,
+                now_ms(),
+                entry.level.as_ref(),
+                entry.table.as_deref(),
+                entry.message.as_ref(),
+            );
+        }
+        *persisted = logs.len();
+        *last_persist = std::time::Instant::now();
+    }
+
     pub(crate) fn pause_task(&mut self, id: &str) {
         if let Some(t) = self.tasks.iter_mut().find(|t| t.id == id) {
             if t.status == TaskStatus::Running {
@@ -1597,8 +1669,33 @@ impl RowBridgeApp {
                 t.pause.resume();
             }
             self.tasks.remove(pos);
+            store::remove_task(id).unwrap_or_else(|e| eprintln!("[store] 删除任务记录失败：{e}"));
             if self.selected_task_id.as_deref() == Some(id) {
                 self.selected_task_id = self.tasks.first().map(|t| t.id.clone());
+            }
+        }
+    }
+
+    /// 启动时从 SQLite 恢复历史任务（只做展示，不带运行时控制）。
+    pub(crate) fn load_history_tasks() -> Vec<SyncTask> {
+        match store::recent_tasks(100) {
+            Ok(rows) => rows
+                .into_iter()
+                .map(|r| {
+                    SyncTask::from_history(
+                        r.id,
+                        r.src,
+                        r.dst,
+                        &r.status,
+                        r.total_rows,
+                        r.started_at,
+                        r.error,
+                    )
+                })
+                .collect(),
+            Err(e) => {
+                eprintln!("[store] 加载历史任务失败：{e}");
+                Vec::new()
             }
         }
     }
@@ -1696,4 +1793,12 @@ pub(crate) fn now_millis() -> u128 {
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_millis())
         .unwrap_or(0)
+}
+
+/// 当前毫秒时间戳（SQLite 记录用）。
+fn now_ms() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or_default()
 }

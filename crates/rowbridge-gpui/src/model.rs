@@ -408,6 +408,27 @@ impl TaskStatus {
         matches!(self, TaskStatus::Running | TaskStatus::Paused)
     }
 
+    /// SQLite 里存的字符串。
+    pub fn store_key(&self) -> &'static str {
+        match self {
+            TaskStatus::Running => "running",
+            TaskStatus::Paused => "paused",
+            TaskStatus::Completed => "done",
+            TaskStatus::Cancelled => "cancelled",
+            TaskStatus::Failed => "failed",
+        }
+    }
+
+    pub fn from_store_key(key: &str) -> TaskStatus {
+        match key {
+            "running" => TaskStatus::Running,
+            "paused" => TaskStatus::Paused,
+            "cancelled" => TaskStatus::Cancelled,
+            "failed" => TaskStatus::Failed,
+            _ => TaskStatus::Completed,
+        }
+    }
+
     #[allow(dead_code)]
     pub fn label(&self) -> &'static str {
         match self {
@@ -453,6 +474,54 @@ pub struct SyncTask {
     pub progress: HashMap<String, TableProgress>,
     pub logs: Vec<TaskLogEntry>,
     pub error: Option<String>,
+}
+
+impl SyncTask {
+    /// 从 SQLite 历史恢复的任务卡片（进度/日志默认空，选中时再按需拉日志）。
+    pub fn from_history(
+        id: String,
+        src: String,
+        dst: String,
+        status: &str,
+        _total_rows: u64,
+        started_at: i64,
+        error: Option<String>,
+    ) -> SyncTask {
+        let created_at = chrono::DateTime::from_timestamp(started_at, 0)
+            .map(|t| t.format("%H:%M:%S").to_string())
+            .unwrap_or_default();
+        // 历史格式是「实例/库」两个字段，展示名与地址只能取到实例部分。
+        let src_name = src.clone();
+        let dst_name = dst.clone();
+        let (src_ep, src_schema) = split_endpoint(&src);
+        let (dst_ep, dst_schema) = split_endpoint(&dst);
+        SyncTask {
+            name: format!("{src_schema} → {dst_schema}"),
+            created_at,
+            src_name,
+            dst_name,
+            src_ep: src_ep.to_string(),
+            dst_ep: dst_ep.to_string(),
+            src_schema: src_schema.to_string(),
+            dst_schema: dst_schema.to_string(),
+            tables: Vec::new(),
+            status: TaskStatus::from_store_key(status),
+            cancel: CancellationToken::new(),
+            pause: rowbridge_core::engine::PauseController::new(),
+            progress: HashMap::new(),
+            logs: Vec::new(),
+            error,
+            id,
+        }
+    }
+}
+
+/// 拆「host:port/schema」。
+fn split_endpoint(ep: &str) -> (&str, &str) {
+    match ep.split_once('/') {
+        Some((h, s)) => (h, s),
+        None => (ep, ""),
+    }
 }
 
 impl SyncTask {
