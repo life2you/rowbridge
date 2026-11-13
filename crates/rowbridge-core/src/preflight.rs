@@ -823,7 +823,10 @@ fn compare_columns(
     if !missing_cols.is_empty() {
         checks.push(Check::warn(
             "column_missing_in_target",
-            format!("目标表缺少列 {:?}，支持先同步表结构自动补全", missing_cols),
+            format!(
+                "目标表缺少列 {:?}，开始同步前会自动补列（「高级选项」里可关闭）",
+                missing_cols
+            ),
         ));
     }
 

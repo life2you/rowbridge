@@ -213,14 +213,12 @@ pub async fn sync_schema(
             }
         }
 
-        // 3. 如果已有表缺少列（结构变更）
-        for alter_sql in &pf.alter_sqls {
-            match dst.query_drop(alter_sql).await {
-                Ok(()) => {
-                    out.columns_added.push(alter_sql.clone());
-                }
+        // 3. 如果已有表缺少列（结构变更）：按实时结构补，不用预检快照
+        if !pf.needs_create_table {
+            match ensure_columns(&mut src, &mut dst, pf, &cfg.options, &EventSink::silent()).await {
+                Ok(done) => out.columns_added.extend(done),
                 Err(e) => {
-                    let err_msg = format!("执行结构变更失败 ({alter_sql}): {e}");
+                    let err_msg = e.to_string();
                     out.errors.push(err_msg.clone());
                     if !cfg.options.continue_on_error {
                         return Err(Error::Other(err_msg));
@@ -451,6 +449,120 @@ async fn connect(cfg: &ConnConfig, label: &str) -> Result<Conn> {
 }
 
 /// 建库 + 建表。
+/// 目标表缺列时自动补列。
+///
+/// 不直接用预检里算好的 `alter_sqls`：预检到真正开始同步之间目标表结构可能被改过，
+/// 用实时 introspection 再算一遍，才不会「预检说没事、同步报 1054」。
+async fn ensure_columns(
+    src: &mut Conn,
+    dst: &mut Conn,
+    pf: &TablePreflight,
+    opts: &TaskOptions,
+    sink: &EventSink,
+) -> Result<Vec<String>> {
+    let src_detail = introspect::table_detail(src, &pf.source_schema, &pf.table).await?;
+    let dst_detail = introspect::table_detail(dst, &pf.target_schema, &pf.target_table).await?;
+
+    let mut missing: Vec<String> = Vec::new();
+    let mut missing_in_source: Vec<String> = Vec::new();
+    let mut ddls: Vec<String> = Vec::new();
+    let ver = introspect::server_version(dst).await.unwrap_or((0, 0, 0));
+    // 目标列顺序的快照；每追加一列就同步更新，后面的列才能接在它后面，
+    // 否则多条 ADD COLUMN 都以同一列为锚点，顺序会颠倒。
+    let mut dst_cols: Vec<String> = dst_detail.columns.iter().map(|c| c.name.clone()).collect();
+    for name in &pf.columns {
+        let Some(s_col) = src_detail.columns.iter().find(|c| &c.name == name) else {
+            missing_in_source.push(name.clone());
+            continue;
+        };
+        if dst_cols.iter().any(|c| c == name) {
+            continue;
+        }
+        let src_idx = src_detail
+            .columns
+            .iter()
+            .position(|c| &c.name == name)
+            .unwrap_or(0);
+        // 源表里紧邻的前一个「目标端已存在」的列，作为 AFTER 锚点
+        let after_col: Option<String> = if src_idx > 0 {
+            src_detail.columns[..src_idx]
+                .iter()
+                .rev()
+                .find(|c| dst_cols.contains(&c.name))
+                .map(|c| c.name.clone())
+        } else {
+            None
+        };
+        let insert_at = after_col
+            .as_ref()
+            .and_then(|a| dst_cols.iter().position(|c| c == a))
+            .map(|p| p + 1)
+            .unwrap_or(0);
+        dst_cols.insert(insert_at, name.clone());
+        ddls.push(preflight::build_add_column_ddl(
+            &pf.target_schema,
+            &pf.target_table,
+            s_col,
+            after_col.as_deref(),
+            ver,
+        ));
+        missing.push(name.clone());
+    }
+
+    // 源表里都找不到这些列，说明预检结果过期（源表结构变了），SELECT 必然报 1054。
+    if !missing_in_source.is_empty() {
+        return Err(Error::Other(format!(
+            "源表 {}.{} 已不存在这些列：{missing_in_source:?}（预检结果已过期，请重新预检）",
+            pf.source_schema, pf.table
+        )));
+    }
+
+    if ddls.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    if !opts.add_missing_columns {
+        sink.emit(Event::Log {
+            table: Some(pf.table.clone()),
+            level: "warn".into(),
+            message: format!("目标表缺少列 {missing:?} 且未开启「缺列自动补」，写入可能报 1054"),
+        });
+        return Ok(Vec::new());
+    }
+
+    let mut done: Vec<String> = Vec::new();
+    for alter_sql in ddls {
+        match dst.query_drop(&alter_sql).await {
+            Ok(()) => {
+                done.push(alter_sql.clone());
+                sink.emit(Event::Log {
+                    table: Some(pf.table.clone()),
+                    level: "info".into(),
+                    message: format!("目标表缺列，已自动补列：{alter_sql}"),
+                })
+            }
+            Err(e) => {
+                let msg = e.to_string();
+                // 并发同步时列可能刚被另一个任务补上，重复列不算失败。
+                if msg.contains("Duplicate column") {
+                    continue;
+                }
+                return Err(Error::Other(format!(
+                    "自动补列失败: {msg}\nSQL: {alter_sql}"
+                )));
+            }
+        }
+    }
+    if !missing.is_empty() {
+        sink.emit(Event::Log {
+            table: Some(pf.table.clone()),
+            level: "info".into(),
+            message: format!("已补齐 {} 个缺失列：{missing:?}", missing.len()),
+        });
+    }
+    Ok(done)
+}
+
 async fn prepare_table(
     src: &mut Conn,
     dst: &mut Conn,
@@ -497,6 +609,10 @@ async fn prepare_table(
     }
 
     if introspect::table_exists(dst, &pf.target_schema, &pf.target_table).await? {
+        // 目标表缺列：写入会直接报 1054 Unknown column，所以先把结构补齐。
+        // 补列放在 TRUNCATE 之前 —— 万一补列失败，至少不会把已有数据清掉。
+        let _ = ensure_columns(src, dst, pf, opts, sink).await?;
+
         if should_truncate {
             if opts.disable_foreign_key_checks {
                 let _ = dst.query_drop("SET FOREIGN_KEY_CHECKS = 0").await;
@@ -1071,18 +1187,24 @@ async fn fetch_batch(src: &mut Conn, run: &TableRun) -> Result<(Vec<Vec<Value>>,
 
     let params = Params::Positional(params);
 
-    let mut result = src.exec_iter(sql, params).await?;
+    let read_err = |e: mysql_async::Error| {
+        Error::Other(format!(
+            "读取源表 {}.{} 失败: {e}",
+            run.src_schema, run.src_table
+        ))
+    };
+    let mut result = src.exec_iter(sql, params).await.map_err(read_err)?;
     let mut rows: Vec<Vec<Value>> = Vec::with_capacity(run.batch_size.min(4096));
     let mut bytes: u64 = 0;
 
-    while let Some(row) = result.next().await? {
+    while let Some(row) = result.next().await.map_err(read_err)? {
         let values = row.unwrap();
         for v in &values {
             bytes += value::value_wire_size(v) as u64;
         }
         rows.push(values);
     }
-    result.drop_result().await?;
+    result.drop_result().await.map_err(read_err)?;
 
     Ok((rows, bytes))
 }
@@ -1195,7 +1317,10 @@ async fn write_batch(
     // 所以这里其实不需要显式事务 —— 之前每批发 START/COMMIT 是多余的开销。
     match dst.exec_drop(sql, Params::Positional(params)).await {
         Ok(()) => Ok(()),
-        Err(e) => Err(e.into()),
+        Err(e) => Err(Error::Other(format!(
+            "写入目标表 {}.{} 失败: {e}",
+            run.dst_schema, run.dst_table
+        ))),
     }
 }
 

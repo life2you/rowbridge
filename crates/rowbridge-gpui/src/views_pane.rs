@@ -268,6 +268,7 @@ impl RowBridgeApp {
             "strip-fk" => self.opt.strip_foreign_keys = value,
             "strip-ai" => self.opt.strip_auto_increment = value,
             "map-coll" => self.opt.map_collation = value,
+            "add-cols" => self.opt.add_missing_columns = value,
             "fk-off" => self.opt.disable_foreign_key_checks = value,
             "truncate" => self.opt.truncate_target = value,
             "relax-sql" => self.opt.relax_sql_mode = value,
@@ -948,9 +949,10 @@ impl RowBridgeApp {
     fn advanced_grid(&self, cx: &mut Context<Self>) -> AnyElement {
         let accent = cx.theme().accent;
         let danger = cx.theme().danger;
-        let toggles: [(&'static str, &str, bool); 9] = [
+        let toggles: [(&'static str, &str, bool); 10] = [
             ("create-table", "自动建表", self.opt.create_table),
             ("create-db", "自动建库", self.opt.create_database),
+            ("add-cols", "缺列自动补", self.opt.add_missing_columns),
             ("strip-fk", "移除外键约束", self.opt.strip_foreign_keys),
             ("strip-ai", "移除自增属性", self.opt.strip_auto_increment),
             ("map-coll", "collation 映射", self.opt.map_collation),

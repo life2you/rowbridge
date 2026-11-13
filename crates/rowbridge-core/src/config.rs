@@ -287,6 +287,9 @@ pub struct TaskOptions {
     /// 建表时做 collation 降级映射
     #[serde(default = "default_true")]
     pub map_collation: bool,
+    /// 目标表已存在但缺少源表列时，开始同步前自动 ALTER TABLE ADD COLUMN
+    #[serde(default = "default_true")]
+    pub add_missing_columns: bool,
 
     /// 会话级 foreign_key_checks=0
     #[serde(default)]
@@ -337,6 +340,7 @@ impl Default for TaskOptions {
             strip_foreign_keys: true,
             strip_auto_increment: true,
             map_collation: true,
+            add_missing_columns: true,
             disable_foreign_key_checks: false,
             truncate_target: false,
             relax_sql_mode: false,

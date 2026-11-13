@@ -1195,6 +1195,7 @@ impl RowBridgeApp {
             strip_foreign_keys: self.opt.strip_foreign_keys,
             strip_auto_increment: self.opt.strip_auto_increment,
             map_collation: self.opt.map_collation,
+            add_missing_columns: self.opt.add_missing_columns,
             disable_foreign_key_checks: self.opt.disable_foreign_key_checks,
             truncate_target: self.opt.truncate_target,
             relax_sql_mode: self.opt.relax_sql_mode,
