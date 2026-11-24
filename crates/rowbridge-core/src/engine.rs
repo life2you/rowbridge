@@ -12,8 +12,8 @@
 //! 写入端用 `INSERT ... ON DUPLICATE KEY UPDATE`，因此任务可随时中断重跑，
 //! 断点由目标表 `MAX(pk)` 自然推导，不需要额外的进度表。
 
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 use futures_util::stream::{FuturesUnordered, StreamExt};
@@ -26,7 +26,9 @@ use tokio_util::sync::CancellationToken;
 use crate::config::{ConnConfig, CursorStart, TableTaskConfig, TaskConfig, TaskOptions, WriteMode};
 use crate::introspect;
 use crate::preflight::{self, TablePreflight};
-use crate::value::{self, parse_cursor_value, qualified, quote_ident, Cursor};
+use crate::value::{
+    self, i128_to_pk_value, parse_cursor_value, qualified, quote_ident, value_as_i128, Cursor,
+};
 use crate::{Error, Result};
 
 /// MySQL 单语句占位符上限。
@@ -60,6 +62,34 @@ pub enum Event {
         batch_size: usize,
         elapsed_ms: u64,
     },
+    /// 单表启用多分片并行时，下发各分片规划清单
+    TableShardsPlanned {
+        table: String,
+        shards: Vec<ShardInfo>,
+    },
+    /// 某个分片完成了一批同步
+    ShardBatchDone {
+        table: String,
+        shard_index: usize,
+        rows: u64,
+        total_rows: u64,
+        cursor: String,
+        rows_per_sec: f64,
+        percent: f32,
+    },
+    /// 某个分片同步完成
+    ShardDone {
+        table: String,
+        shard_index: usize,
+        rows: u64,
+        elapsed_ms: u64,
+    },
+    /// 某个分片同步失败
+    ShardFailed {
+        table: String,
+        shard_index: usize,
+        error: String,
+    },
     TableDone {
         table: String,
         rows: u64,
@@ -85,6 +115,13 @@ pub enum Event {
         elapsed_ms: u64,
     },
     Cancelled,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ShardInfo {
+    pub index: usize,
+    pub total: usize,
+    pub range: String,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -682,7 +719,200 @@ async fn source_schema_charset(conn: &mut Conn, schema: &str) -> Result<(String,
     }
 }
 
-/// 单表同步，返回统计。失败时按 `continue_on_error` 决定是否上抛。
+/// 单表主键分片区间（用于规划切分与单元测试）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ShardRange {
+    index: usize,
+    total: usize,
+    lo: i128,
+    /// `Some(v)` 表示带 `pk <= v` 上界；`None` 表示最后一片且未显式指定结束 ID，不封顶。
+    hi: Option<i128>,
+}
+
+/// 将闭区间 `[lo, hi]` 尽量均匀地切分为最多 `threads` 个互斥子区间。
+fn compute_pk_shards(
+    lo: i128,
+    hi: i128,
+    threads: usize,
+    explicit_end: bool,
+) -> Vec<ShardRange> {
+    if lo > hi {
+        return Vec::new();
+    }
+    let threads = threads.max(1);
+    let span: u128 = lo.abs_diff(hi).saturating_add(1);
+    let count = (threads as u128).min(span) as usize;
+    let base = span / (count as u128);
+    let rem = span % (count as u128);
+
+    let mut shards = Vec::with_capacity(count);
+    let mut cur = lo;
+    for idx in 0..count {
+        let len = base + u128::from((idx as u128) < rem);
+        let offset = i128::try_from(len - 1).expect("分片跨度在 i128 范围内");
+        let s_lo = cur;
+        let s_hi = s_lo + offset;
+        if idx + 1 < count {
+            cur = s_hi + 1;
+        }
+        let hi_bound = if idx + 1 == count && !explicit_end {
+            None
+        } else {
+            Some(s_hi)
+        };
+        shards.push(ShardRange {
+            index: idx,
+            total: count,
+            lo: s_lo,
+            hi: hi_bound,
+        });
+    }
+    shards
+}
+
+#[derive(Debug, Clone)]
+enum ShardStart {
+    /// 单线程模式直接在自身连接上解析起点，避免多建连接
+    Deferred(CursorStart, Option<String>),
+    /// 已确定的游标起点
+    Fixed { cursor: Cursor, inclusive: bool },
+}
+
+#[derive(Debug, Clone)]
+struct ShardSpec {
+    index: usize,
+    total: usize,
+    start: ShardStart,
+    end_id: Option<i128>,
+    end_pk: Option<Value>,
+    planned_lo: Option<i128>,
+    planned_hi: Option<i128>,
+    range_label: String,
+}
+
+fn shard_percent(
+    lo: Option<i128>,
+    hi: Option<i128>,
+    cur: Option<i128>,
+    unbounded_tail: bool,
+) -> f32 {
+    let (Some(lo), Some(hi), Some(cur)) = (lo, hi, cur) else {
+        return 0.0;
+    };
+    if hi < lo || cur < lo {
+        return 0.0;
+    }
+    let span = lo.abs_diff(hi).saturating_add(1);
+    if cur >= hi && unbounded_tail {
+        return 99.9;
+    }
+    let done = lo.abs_diff(cur).saturating_add(1).min(span);
+    ((done as f64) * 100.0 / (span as f64)).clamp(0.0, 100.0) as f32
+}
+
+/// 同一张表内多分片共享的实时进度汇总器。
+struct TableProgressTracker {
+    total_rows: AtomicU64,
+    total_batches: AtomicU64,
+    shard_rps: Mutex<Vec<f64>>,
+    shard_cursors: Mutex<Vec<Option<String>>>,
+    last_cursor: Mutex<String>,
+}
+
+impl TableProgressTracker {
+    fn new(shard_count: usize) -> Self {
+        let n = shard_count.max(1);
+        Self {
+            total_rows: AtomicU64::new(0),
+            total_batches: AtomicU64::new(0),
+            shard_rps: Mutex::new(vec![0.0; n]),
+            shard_cursors: Mutex::new(vec![None; n]),
+            last_cursor: Mutex::new(String::new()),
+        }
+    }
+
+    fn on_batch(
+        &self,
+        shard_idx: usize,
+        returned: usize,
+        rps: f64,
+        cursor_disp: String,
+    ) -> (u64, f64, String) {
+        let total = self
+            .total_rows
+            .fetch_add(returned as u64, Ordering::Relaxed)
+            + returned as u64;
+        self.total_batches.fetch_add(1, Ordering::Relaxed);
+
+        let sum_rps = {
+            let mut rps_vec = self.shard_rps.lock().unwrap_or_else(|e| e.into_inner());
+            if shard_idx < rps_vec.len() {
+                rps_vec[shard_idx] = rps;
+            }
+            rps_vec.iter().sum()
+        };
+
+        let cursor_summary = {
+            let mut cur_vec = self
+                .shard_cursors
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            if shard_idx < cur_vec.len() {
+                cur_vec[shard_idx] = Some(cursor_disp.clone());
+            }
+            if cur_vec.len() <= 1 {
+                cursor_disp
+            } else if cur_vec.len() <= 4 {
+                let parts: Vec<String> = cur_vec
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(i, v)| v.as_ref().map(|s| format!("#{} {s}", i + 1)))
+                    .collect();
+                if parts.is_empty() {
+                    cursor_disp
+                } else {
+                    parts.join(" · ")
+                }
+            } else {
+                format!("{}线程 · 最新 {cursor_disp}", cur_vec.len())
+            }
+        };
+
+        *self.last_cursor.lock().unwrap_or_else(|e| e.into_inner()) = cursor_summary.clone();
+        (total, sum_rps, cursor_summary)
+    }
+
+    fn finish_shard(&self, shard_idx: usize) {
+        let mut rps_vec = self.shard_rps.lock().unwrap_or_else(|e| e.into_inner());
+        if shard_idx < rps_vec.len() {
+            rps_vec[shard_idx] = 0.0;
+        }
+    }
+
+    fn snapshot(&self) -> (u64, u64, String) {
+        (
+            self.total_rows.load(Ordering::Relaxed),
+            self.total_batches.load(Ordering::Relaxed),
+            self.last_cursor
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .clone(),
+        )
+    }
+}
+
+struct ShardRpsGuard<'a> {
+    tracker: &'a TableProgressTracker,
+    shard_idx: usize,
+}
+
+impl Drop for ShardRpsGuard<'_> {
+    fn drop(&mut self) {
+        self.tracker.finish_shard(self.shard_idx);
+    }
+}
+
+/// 单表同步，返回统计。失败时按表级/全局 `continue_on_error` 决定是否上抛。
 async fn run_table(
     src_cfg: ConnConfig,
     dst_cfg: ConnConfig,
@@ -695,6 +925,7 @@ async fn run_table(
 ) -> Result<TableStats> {
     let table = pf.table.clone();
     let started = Instant::now();
+    let eff_continue_on_error = table_cfg.effective_continue_on_error(&opts);
 
     sink.emit(Event::TableStarted {
         table: table.clone(),
@@ -708,8 +939,16 @@ async fn run_table(
         ..Default::default()
     };
 
-    let result = sync_one(
-        &src_cfg, &dst_cfg, &opts, &table_cfg, &pf, &sink, &cancel, &pause, &mut stats,
+    let result = run_table_inner(
+        &src_cfg,
+        &dst_cfg,
+        &opts,
+        &table_cfg,
+        &pf,
+        &sink,
+        &cancel,
+        &pause,
+        &mut stats,
     )
     .await;
     stats.elapsed_ms = started.elapsed().as_millis() as u64;
@@ -740,7 +979,7 @@ async fn run_table(
                 table,
                 error: e.to_string(),
             });
-            if opts.continue_on_error {
+            if eff_continue_on_error {
                 Ok(stats)
             } else {
                 Err(e)
@@ -749,7 +988,7 @@ async fn run_table(
     }
 }
 
-async fn sync_one(
+async fn run_table_inner(
     src_cfg: &ConnConfig,
     dst_cfg: &ConnConfig,
     opts: &TaskOptions,
@@ -767,6 +1006,332 @@ async fn sync_one(
             table: pf.table.clone(),
             actual: "无主键".into(),
         })?;
+
+    let shards = plan_table_shards(src_cfg, dst_cfg, opts, table_cfg, pf, &pk, sink).await?;
+    if shards.is_empty() {
+        sink.emit(Event::Log {
+            table: Some(pf.table.clone()),
+            level: "info".into(),
+            message: "同步区间为空，无需搬运数据".into(),
+        });
+        return Ok(());
+    }
+
+    let tracker = Arc::new(TableProgressTracker::new(shards.len()));
+
+    if shards.len() == 1 {
+        let spec = shards.into_iter().next().expect("非空");
+        sync_shard(
+            src_cfg, dst_cfg, opts, pf, &pk, spec, &tracker, sink, cancel, pause,
+        )
+        .await?;
+    } else {
+        let summary: Vec<String> = shards
+            .iter()
+            .map(|s| format!("#{} {}", s.index + 1, s.range_label))
+            .collect();
+        sink.emit(Event::TableShardsPlanned {
+            table: pf.table.clone(),
+            shards: shards
+                .iter()
+                .map(|s| ShardInfo {
+                    index: s.index,
+                    total: s.total,
+                    range: s.range_label.clone(),
+                })
+                .collect(),
+        });
+        sink.emit(Event::Log {
+            table: Some(pf.table.clone()),
+            level: "info".into(),
+            message: format!(
+                "启用 {} 线程并行分片: {}",
+                shards.len(),
+                summary.join(", ")
+            ),
+        });
+
+        let table_cancel = cancel.child_token();
+        let mut futs = FuturesUnordered::new();
+
+        for spec in shards {
+            let shard_index = spec.index;
+            let src_cfg = src_cfg.clone();
+            let dst_cfg = dst_cfg.clone();
+            let opts = opts.clone();
+            let pf = pf.clone();
+            let pk = pk.clone();
+            let tracker = Arc::clone(&tracker);
+            let sink = sink.clone();
+            let shard_cancel = table_cancel.clone();
+            let pause = pause.clone();
+
+            futs.push(tokio::spawn(async move {
+                let res = sync_shard(
+                    &src_cfg,
+                    &dst_cfg,
+                    &opts,
+                    &pf,
+                    &pk,
+                    spec,
+                    &tracker,
+                    &sink,
+                    &shard_cancel,
+                    &pause,
+                )
+                .await;
+                if let Err(ref e) = res {
+                    if !shard_cancel.is_cancelled() {
+                        sink.emit(Event::ShardFailed {
+                            table: pf.table.clone(),
+                            shard_index,
+                            error: e.to_string(),
+                        });
+                    }
+                }
+                res
+            }));
+        }
+
+        let mut first_err: Option<Error> = None;
+        while let Some(joined) = futs.next().await {
+            match joined {
+                Ok(Ok(())) => {}
+                Ok(Err(e)) => {
+                    if first_err.is_none() {
+                        first_err = Some(e);
+                        table_cancel.cancel();
+                    }
+                }
+                Err(join_err) => {
+                    if first_err.is_none() {
+                        first_err = Some(Error::Other(format!("分片工作线程异常: {join_err}")));
+                        table_cancel.cancel();
+                    }
+                }
+            }
+        }
+
+        if !cancel.is_cancelled() {
+            if let Some(err) = first_err {
+                return Err(err);
+            }
+        }
+    }
+
+    let (rows, batches, last_cursor) = tracker.snapshot();
+    stats.rows = rows;
+    stats.batches = batches;
+    stats.cursor = last_cursor;
+    Ok(())
+}
+
+async fn plan_table_shards(
+    src_cfg: &ConnConfig,
+    dst_cfg: &ConnConfig,
+    opts: &TaskOptions,
+    table_cfg: &TableTaskConfig,
+    pf: &TablePreflight,
+    pk: &str,
+    sink: &EventSink,
+) -> Result<Vec<ShardSpec>> {
+    let eff_threads = table_cfg.effective_table_parallelism(opts);
+    let eff_cursor_start = table_cfg.effective_cursor_start(opts);
+    let eff_start_id = table_cfg
+        .effective_start_id(opts)
+        .filter(|s| !s.trim().is_empty());
+    let eff_end_id = table_cfg
+        .effective_end_id(opts)
+        .filter(|s| !s.trim().is_empty());
+
+    let (end_id, end_pk) = match &eff_end_id {
+        Some(s) => {
+            let v = parse_cursor_value(s, pf.primary_key_unsigned)?;
+            let as_int = value_as_i128(&v)
+                .ok_or_else(|| Error::Config(format!("结束游标 `{s}` 不是合法整数")))?;
+            (Some(as_int), Some(v))
+        }
+        None => (None, None),
+    };
+
+    if table_cfg.has_cursor_override() {
+        sink.emit(Event::Log {
+            table: Some(pf.table.clone()),
+            level: "info".into(),
+            message: format!(
+                "本表独立游标：{} 起 {}，止 {}",
+                match eff_cursor_start {
+                    CursorStart::Full => "全量",
+                    CursorStart::Resume => "续传",
+                    CursorStart::Custom => "自定义",
+                },
+                eff_start_id.as_deref().unwrap_or("无"),
+                eff_end_id.as_deref().unwrap_or("不限"),
+            ),
+        });
+    }
+
+    if let Some(f) = &pf.filter {
+        let trimmed = f.trim();
+        if !trimmed.is_empty() {
+            sink.emit(Event::Log {
+                table: Some(pf.table.clone()),
+                level: "info".into(),
+                message: format!("附加条件过滤: {trimmed}"),
+            });
+        }
+    }
+
+    if eff_threads <= 1 {
+        return Ok(vec![ShardSpec {
+            index: 0,
+            total: 1,
+            start: ShardStart::Deferred(eff_cursor_start, eff_start_id),
+            end_id,
+            end_pk,
+            planned_lo: None,
+            planned_hi: end_id,
+            range_label: String::new(),
+        }]);
+    }
+
+    // 多线程分片：仅在需要解析未知端时连接查 MIN/MAX(pk)（均走主键极值 O(1)）。
+    let explicit_start = if eff_cursor_start == CursorStart::Custom {
+        match &eff_start_id {
+            Some(s) => {
+                let v = parse_cursor_value(s, pf.primary_key_unsigned)?;
+                Some(
+                    value_as_i128(&v)
+                        .ok_or_else(|| Error::Config(format!("起始游标 `{s}` 不是合法整数")))?,
+                )
+            }
+            None => None,
+        }
+    } else {
+        None
+    };
+
+    let need_src_min = match eff_cursor_start {
+        CursorStart::Full => true,
+        CursorStart::Custom => explicit_start.is_none(),
+        CursorStart::Resume => false,
+    };
+    let explicit_end = end_id.is_some();
+    let need_src_max = !explicit_end;
+
+    let mut resume_lo: Option<i128> = None;
+    let mut need_src_min_fallback = need_src_min;
+
+    if eff_cursor_start == CursorStart::Resume {
+        let mut dst = connect(dst_cfg, "目标").await?;
+        let dst_max = read_max_pk(&mut dst, &pf.target_schema, &pf.target_table, pk).await?;
+        let _ = dst.disconnect().await;
+        match dst_max {
+            Some(v) => {
+                let m = value_as_i128(&v)
+                    .ok_or_else(|| Error::Other(format!("目标表最大主键不是合法整数")))?;
+                resume_lo = Some(m.saturating_add(1));
+            }
+            None => {
+                need_src_min_fallback = true;
+            }
+        }
+    }
+
+    let (src_min, src_max) = if need_src_min_fallback || need_src_max {
+        let mut src = connect(src_cfg, "源").await?;
+        let bounds = match (need_src_min_fallback, need_src_max) {
+            (true, true) => read_pk_bounds(&mut src, &pf.source_schema, &pf.table, pk).await?,
+            (true, false) => {
+                (
+                    read_pk_bound(&mut src, &pf.source_schema, &pf.table, pk, false).await?,
+                    None,
+                )
+            }
+            (false, true) => (
+                None,
+                read_pk_bound(&mut src, &pf.source_schema, &pf.table, pk, true).await?,
+            ),
+            (false, false) => (None, None),
+        };
+        let _ = src.disconnect().await;
+        bounds
+    } else {
+        (None, None)
+    };
+
+    let lo = match (eff_cursor_start, explicit_start, resume_lo) {
+        (CursorStart::Custom, Some(s), _) => s,
+        (CursorStart::Resume, _, Some(r)) => r,
+        _ => match src_min.as_ref().and_then(value_as_i128) {
+            Some(v) => v,
+            None => return Ok(Vec::new()),
+        },
+    };
+
+    let hi = match end_id {
+        Some(e) => e,
+        None => match src_max.as_ref().and_then(value_as_i128) {
+            Some(v) => v,
+            None => return Ok(Vec::new()),
+        },
+    };
+
+    let ranges = compute_pk_shards(lo, hi, eff_threads, explicit_end);
+    if ranges.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let mut specs = Vec::with_capacity(ranges.len());
+    for r in ranges {
+        let start_val = i128_to_pk_value(r.lo, pf.primary_key_unsigned)?;
+        let end_val = match r.hi {
+            Some(h) => Some(i128_to_pk_value(h, pf.primary_key_unsigned)?),
+            None => None,
+        };
+        let range_label = match r.hi {
+            Some(h) => format!("[{}..={}]", r.lo, h),
+            None => format!("[{}..不限]", r.lo),
+        };
+        specs.push(ShardSpec {
+            index: r.index,
+            total: r.total,
+            start: ShardStart::Fixed {
+                cursor: Cursor(Some(start_val)),
+                inclusive: true,
+            },
+            end_id: r.hi,
+            end_pk: end_val,
+            planned_lo: Some(r.lo),
+            planned_hi: Some(r.hi.unwrap_or(hi)),
+            range_label,
+        });
+    }
+    Ok(specs)
+}
+
+async fn sync_shard(
+    src_cfg: &ConnConfig,
+    dst_cfg: &ConnConfig,
+    opts: &TaskOptions,
+    pf: &TablePreflight,
+    pk: &str,
+    spec: ShardSpec,
+    tracker: &TableProgressTracker,
+    sink: &EventSink,
+    cancel: &CancellationToken,
+    pause: &PauseController,
+) -> Result<()> {
+    let _guard = ShardRpsGuard {
+        tracker,
+        shard_idx: spec.index,
+    };
+    let shard_started = Instant::now();
+    let shard_tag = if spec.total > 1 {
+        format!("[分片 {}/{}] ", spec.index + 1, spec.total)
+    } else {
+        String::new()
+    };
 
     let mut src = connect(src_cfg, "源").await?;
     let mut dst = connect(dst_cfg, "目标").await?;
@@ -805,71 +1370,38 @@ async fn sync_one(
         }
     };
 
-    // 每张表有自己的游标：表级配置优先，没有则回落到全局。
-    let eff_cursor_start = table_cfg.effective_cursor_start(opts);
-    let eff_start_id = table_cfg
-        .effective_start_id(opts)
-        .filter(|s| !s.trim().is_empty());
-    let eff_end_id = table_cfg
-        .effective_end_id(opts)
-        .filter(|s| !s.trim().is_empty());
-
-    let (cursor, cursor_inclusive) = match eff_cursor_start {
-        CursorStart::Full => (Cursor::start(), false),
-        CursorStart::Resume => {
-            let max = read_max_pk(&mut dst, &pf.target_schema, &pf.target_table, &pk).await?;
-            (Cursor::from_max_pk(max), false)
-        }
-        CursorStart::Custom => match &eff_start_id {
-            Some(s) => (
-                Cursor(Some(parse_cursor_value(s, pf.primary_key_unsigned)?)),
-                true, // 自定义起始ID包含此行（闭区间 [start_id, end_id]）
-            ),
-            _ => (Cursor::start(), false),
+    let (cursor, cursor_inclusive) = match spec.start {
+        ShardStart::Fixed { cursor, inclusive } => (cursor, inclusive),
+        ShardStart::Deferred(eff_cursor_start, eff_start_id) => match eff_cursor_start {
+            CursorStart::Full => (Cursor::start(), false),
+            CursorStart::Resume => {
+                let max = read_max_pk(&mut dst, &pf.target_schema, &pf.target_table, pk).await?;
+                (Cursor::from_max_pk(max), false)
+            }
+            CursorStart::Custom => match &eff_start_id {
+                Some(s) => (
+                    Cursor(Some(parse_cursor_value(s, pf.primary_key_unsigned)?)),
+                    true, // 自定义起始ID包含此行（闭区间 [start_id, end_id]）
+                ),
+                _ => (Cursor::start(), false),
+            },
         },
     };
-
-    let (end_id, end_pk) = match &eff_end_id {
-        Some(s) => {
-            let v = parse_cursor_value(s, pf.primary_key_unsigned)?;
-            let as_int = value::value_as_i128(&v)
-                .ok_or_else(|| Error::Config(format!("结束游标 `{s}` 不是合法整数")))?;
-            (Some(as_int), Some(v))
-        }
-        None => (None, None),
-    };
-
-    if table_cfg.has_cursor_override() {
-        sink.emit(Event::Log {
-            table: Some(pf.table.clone()),
-            level: "info".into(),
-            message: format!(
-                "本表独立游标：{} 起 {}，止 {}",
-                match eff_cursor_start {
-                    CursorStart::Full => "全量",
-                    CursorStart::Resume => "续传",
-                    CursorStart::Custom => "自定义",
-                },
-                eff_start_id.as_deref().unwrap_or("无"),
-                eff_end_id.as_deref().unwrap_or("不限"),
-            ),
-        });
-    }
 
     let pk_index = pf
         .columns
         .iter()
-        .position(|c| c == &pk)
+        .position(|c| c == pk)
         .ok_or_else(|| Error::Other(format!("主键 {pk} 不在同步列中")))?;
 
     let mut run = TableRun {
-        pk,
+        pk: pk.to_string(),
         pk_index,
         columns: pf.columns.clone(),
         cursor,
         cursor_inclusive,
-        end_id,
-        end_pk,
+        end_id: spec.end_id,
+        end_pk: spec.end_pk,
         batch_size: initial_batch.clamp(MIN_BATCH, opts.max_batch_size.max(MIN_BATCH)),
         src_schema: pf.source_schema.clone(),
         dst_schema: pf.target_schema.clone(),
@@ -878,15 +1410,7 @@ async fn sync_one(
         filter: pf.filter.clone(),
     };
 
-    if let Some(f) = &run.filter {
-        sink.emit(Event::Log {
-            table: Some(pf.table.clone()),
-            level: "info".into(),
-            message: format!("附加条件过滤: {f}"),
-        });
-    }
-
-    if !run.cursor.is_start() {
+    if spec.total == 1 && !run.cursor.is_start() {
         let op = if run.cursor_inclusive { ">=" } else { ">" };
         sink.emit(Event::Log {
             table: Some(pf.table.clone()),
@@ -903,6 +1427,7 @@ async fn sync_one(
     run.batch_size = run.batch_size.min(placeholder_cap);
 
     let mut sql_cache: Option<(usize, String)> = None;
+    let mut shard_rows: u64 = 0;
 
     loop {
         if cancel.is_cancelled() {
@@ -918,7 +1443,7 @@ async fn sync_one(
         // 若用改动后的值判断「是否已读完」，批大小翻倍时会误判提前结束而静默丢行。
         let fetch_size = run.batch_size;
         let (rows, wire_bytes) =
-            fetch_batch_retry(&mut src, src_cfg, opts, &run, sink, &pf.table).await?;
+            fetch_batch_retry(&mut src, src_cfg, opts, &run, sink, &pf.table, &shard_tag).await?;
         if rows.is_empty() {
             break;
         }
@@ -931,7 +1456,7 @@ async fn sync_one(
             .expect("非空");
         if matches!(last_pk, Value::NULL) {
             return Err(Error::Other(format!(
-                "主键 {} 出现 NULL，无法用游标推进",
+                "{shard_tag}主键 {} 出现 NULL，无法用游标推进",
                 run.pk
             )));
         }
@@ -943,7 +1468,7 @@ async fn sync_one(
             sink.emit(Event::Warning {
                 table: Some(pf.table.clone()),
                 message: format!(
-                    "本批约 {:.1}MB 超过包预算 {:.1}MB，批大小降至 {}",
+                    "{shard_tag}本批约 {:.1}MB 超过包预算 {:.1}MB，批大小降至 {}",
                     wire_bytes as f64 / 1e6,
                     budget as f64 / 1e6,
                     run.batch_size
@@ -961,6 +1486,7 @@ async fn sync_one(
             use_new_upsert,
             sink,
             &pf.table,
+            &shard_tag,
             &mut sql_cache,
         )
         .await;
@@ -974,7 +1500,7 @@ async fn sync_one(
                 run.batch_size = (run.batch_size / 2).max(MIN_BATCH);
                 sink.emit(Event::Warning {
                     table: Some(pf.table.clone()),
-                    message: format!("{}，批大小降至 {}", e, run.batch_size),
+                    message: format!("{shard_tag}{e}，批大小降至 {}", run.batch_size),
                 });
                 continue;
             }
@@ -983,9 +1509,7 @@ async fn sync_one(
 
         run.cursor.advance(last_pk);
         run.cursor_inclusive = false;
-        stats.rows += returned as u64;
-        stats.batches += 1;
-        stats.cursor = run.cursor.display();
+        shard_rows += returned as u64;
 
         let elapsed = start.elapsed();
         let rps = if elapsed.as_secs_f64() > 0.0 {
@@ -1012,23 +1536,48 @@ async fn sync_one(
             run.batch_size = target.clamp(MIN_BATCH, cap);
         }
 
+        let cur_disp = run.cursor.display();
+        let cur_int = run.cursor.as_i128();
+        let (total_rows, sum_rps, cursor_summary) =
+            tracker.on_batch(spec.index, returned, rps, cur_disp.clone());
+
         sink.emit(Event::BatchDone {
             table: pf.table.clone(),
             rows: returned as u64,
-            total_rows: stats.rows,
-            cursor: run.cursor.display(),
-            rows_per_sec: rps,
+            total_rows,
+            cursor: cursor_summary,
+            rows_per_sec: sum_rps,
             batch_size: run.batch_size,
             elapsed_ms: elapsed.as_millis() as u64,
         });
 
+        if spec.total > 1 {
+            let pct = shard_percent(
+                spec.planned_lo,
+                spec.planned_hi,
+                cur_int,
+                spec.end_id.is_none(),
+            );
+            sink.emit(Event::ShardBatchDone {
+                table: pf.table.clone(),
+                shard_index: spec.index,
+                rows: returned as u64,
+                total_rows: shard_rows,
+                cursor: cur_disp,
+                rows_per_sec: rps,
+                percent: pct,
+            });
+        }
+
         if let (Some(end), Some(cur)) = (run.end_id, run.cursor.as_i128()) {
             if cur >= end {
-                sink.emit(Event::Log {
-                    table: Some(pf.table.clone()),
-                    level: "info".into(),
-                    message: format!("已到达结束游标 {end}"),
-                });
+                if spec.total == 1 {
+                    sink.emit(Event::Log {
+                        table: Some(pf.table.clone()),
+                        level: "info".into(),
+                        message: format!("已到达结束游标 {end}"),
+                    });
+                }
                 break;
             }
         }
@@ -1038,6 +1587,23 @@ async fn sync_one(
             // 后面自适应可能刚把 batch_size 放大，拿放大后的值比较会导致误判提前结束。
             break;
         }
+    }
+
+    if spec.total > 1 && !cancel.is_cancelled() {
+        sink.emit(Event::ShardDone {
+            table: pf.table.clone(),
+            shard_index: spec.index,
+            rows: shard_rows,
+            elapsed_ms: shard_started.elapsed().as_millis() as u64,
+        });
+        sink.emit(Event::Log {
+            table: Some(pf.table.clone()),
+            level: "info".into(),
+            message: format!(
+                "{shard_tag}{} 完成，同步 {shard_rows} 行",
+                spec.range_label
+            ),
+        });
     }
 
     let _ = src.disconnect().await;
@@ -1072,6 +1638,7 @@ async fn fetch_batch_retry(
     run: &TableRun,
     sink: &EventSink,
     table: &str,
+    shard_tag: &str,
 ) -> Result<(Vec<Vec<Value>>, u64)> {
     let mut attempt = 0;
     loop {
@@ -1082,7 +1649,7 @@ async fn fetch_batch_retry(
                 sink.emit(Event::Warning {
                     table: Some(table.to_string()),
                     message: format!(
-                        "源端读取异常 ({e})，正在第 {attempt}/{} 次重试...",
+                        "{shard_tag}源端读取异常 ({e})，正在第 {attempt}/{} 次重试...",
                         opts.max_retries
                     ),
                 });
@@ -1109,6 +1676,7 @@ async fn write_batch_retry(
     use_new_upsert: bool,
     sink: &EventSink,
     table: &str,
+    shard_tag: &str,
     sql_cache: &mut Option<(usize, String)>,
 ) -> Result<()> {
     let mut attempt = 0;
@@ -1124,7 +1692,7 @@ async fn write_batch_retry(
                 sink.emit(Event::Warning {
                     table: Some(table.to_string()),
                     message: format!(
-                        "目标端写入异常 ({e})，正在第 {attempt}/{} 次重试...",
+                        "{shard_tag}目标端写入异常 ({e})，正在第 {attempt}/{} 次重试...",
                         opts.max_retries
                     ),
                 });
@@ -1350,13 +1918,47 @@ async fn read_max_pk(
     table: &str,
     pk: &str,
 ) -> Result<Option<Value>> {
+    read_pk_bound(conn, schema, table, pk, true).await
+}
+
+async fn read_pk_bound(
+    conn: &mut Conn,
+    schema: &str,
+    table: &str,
+    pk: &str,
+    is_max: bool,
+) -> Result<Option<Value>> {
+    let agg = if is_max { "MAX" } else { "MIN" };
     let sql = format!(
-        "SELECT MAX({}) FROM {}",
+        "SELECT {agg}({}) FROM {}",
         quote_ident(pk),
         qualified(schema, table)
     );
     let row: Option<(Option<Value>,)> = conn.query_first(sql).await?;
-    Ok(row.and_then(|(v,)| v))
+    Ok(row
+        .and_then(|(v,)| v)
+        .filter(|v| !matches!(v, Value::NULL)))
+}
+
+async fn read_pk_bounds(
+    conn: &mut Conn,
+    schema: &str,
+    table: &str,
+    pk: &str,
+) -> Result<(Option<Value>, Option<Value>)> {
+    let qpk = quote_ident(pk);
+    let sql = format!(
+        "SELECT MIN({qpk}), MAX({qpk}) FROM {}",
+        qualified(schema, table)
+    );
+    let row: Option<(Option<Value>, Option<Value>)> = conn.query_first(sql).await?;
+    Ok(match row {
+        Some((min_v, max_v)) => (
+            min_v.filter(|v| !matches!(v, Value::NULL)),
+            max_v.filter(|v| !matches!(v, Value::NULL)),
+        ),
+        None => (None, None),
+    })
 }
 
 #[cfg(test)]
@@ -1382,5 +1984,127 @@ mod tests {
         // 单行 2KB，预算 4MB → 2000 行，当前 5000 → 降到 2000
         assert_eq!(shrink_for_budget(5000, 2_000, 4_000_000), 2000);
         assert_eq!(shrink_for_budget(5000, 0, 4_000_000), 5000);
+    }
+
+    #[test]
+    fn compute_pk_shards_even_split_1_to_10000() {
+        let shards = compute_pk_shards(1, 10_000, 4, true);
+        assert_eq!(
+            shards,
+            vec![
+                ShardRange {
+                    index: 0,
+                    total: 4,
+                    lo: 1,
+                    hi: Some(2500)
+                },
+                ShardRange {
+                    index: 1,
+                    total: 4,
+                    lo: 2501,
+                    hi: Some(5000)
+                },
+                ShardRange {
+                    index: 2,
+                    total: 4,
+                    lo: 5001,
+                    hi: Some(7500)
+                },
+                ShardRange {
+                    index: 3,
+                    total: 4,
+                    lo: 7501,
+                    hi: Some(10_000)
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn compute_pk_shards_handles_remainder_negative_u64_and_small_span() {
+        // 余数均匀分配到前几个分片，且未显式指定 end_id 时最后一片不封顶
+        let s1 = compute_pk_shards(1, 10, 4, false);
+        assert_eq!(
+            s1,
+            vec![
+                ShardRange {
+                    index: 0,
+                    total: 4,
+                    lo: 1,
+                    hi: Some(3)
+                },
+                ShardRange {
+                    index: 1,
+                    total: 4,
+                    lo: 4,
+                    hi: Some(6)
+                },
+                ShardRange {
+                    index: 2,
+                    total: 4,
+                    lo: 7,
+                    hi: Some(8)
+                },
+                ShardRange {
+                    index: 3,
+                    total: 4,
+                    lo: 9,
+                    hi: None
+                },
+            ]
+        );
+
+        // 负数跨零区间
+        let s2 = compute_pk_shards(-10, 9, 4, true);
+        assert_eq!(s2[0].lo, -10);
+        assert_eq!(s2[0].hi, Some(-6));
+        assert_eq!(s2[3].lo, 5);
+        assert_eq!(s2[3].hi, Some(9));
+
+        // 接近 u64::MAX 区间不溢出
+        let hi = u64::MAX as i128;
+        let lo = hi - 99;
+        let s3 = compute_pk_shards(lo, hi, 4, true);
+        assert_eq!(s3.len(), 4);
+        assert_eq!(s3[0].lo, lo);
+        assert_eq!(s3[3].hi, Some(hi));
+
+        // 区间比线程数小：仅创建 span 个分片
+        let s4 = compute_pk_shards(5, 6, 4, true);
+        assert_eq!(s4.len(), 2);
+        assert_eq!(s4[0].lo, 5);
+        assert_eq!(s4[0].hi, Some(5));
+        assert_eq!(s4[1].lo, 6);
+        assert_eq!(s4[1].hi, Some(6));
+
+        // 空区间
+        assert!(compute_pk_shards(10, 5, 4, true).is_empty());
+    }
+
+    #[test]
+    fn progress_tracker_aggregates_shards_rps_and_rows() {
+        let tracker = TableProgressTracker::new(4);
+        let (tot1, rps1, cur1) = tracker.on_batch(0, 500, 1000.0, "500".into());
+        assert_eq!(tot1, 500);
+        assert_eq!(rps1, 1000.0);
+        assert_eq!(cur1, "#1 500");
+
+        let (tot2, rps2, cur2) = tracker.on_batch(2, 600, 1500.0, "5600".into());
+        assert_eq!(tot2, 1100);
+        assert_eq!(rps2, 2500.0);
+        assert_eq!(cur2, "#1 500 · #3 5600");
+
+        tracker.finish_shard(0);
+        let (tot3, rps3, _) = tracker.on_batch(2, 400, 1200.0, "6000".into());
+        assert_eq!(tot3, 1500);
+        assert_eq!(rps3, 1200.0);
+    }
+
+    #[test]
+    fn shard_percent_tracks_range_and_unbounded_tail() {
+        assert_eq!(shard_percent(Some(1), Some(2500), Some(1250), false), 50.0);
+        assert_eq!(shard_percent(Some(1), Some(2500), Some(2500), false), 100.0);
+        assert_eq!(shard_percent(Some(7501), Some(10000), Some(10005), true), 99.9);
+        assert_eq!(shard_percent(Some(1), Some(2500), Some(0), false), 0.0);
     }
 }

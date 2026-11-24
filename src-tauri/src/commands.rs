@@ -422,6 +422,7 @@ fn to_task_config(req: &RunRequest) -> Result<TaskConfig, String> {
     let o = &req.options;
     let options = TaskOptions {
         parallelism: o.parallelism.max(1),
+        table_parallelism: 1,
         batch_size: o.batch_size.max(1),
         max_batch_size: o.max_batch_size.max(o.batch_size.max(1)),
         adaptive_batch: o.adaptive_batch,
@@ -438,6 +439,7 @@ fn to_task_config(req: &RunRequest) -> Result<TaskConfig, String> {
         strip_foreign_keys: o.strip_foreign_keys,
         strip_auto_increment: o.strip_auto_increment,
         map_collation: o.map_collation,
+        add_missing_columns: true,
         disable_foreign_key_checks: o.disable_foreign_key_checks,
         truncate_target: o.truncate_target,
         relax_sql_mode: o.relax_sql_mode,
@@ -468,6 +470,7 @@ fn to_task_config(req: &RunRequest) -> Result<TaskConfig, String> {
             strip_foreign_keys: None,
             map_collation: None,
             filter: None,
+            table_parallelism: None,
         })
         .collect();
     Ok(TaskConfig {

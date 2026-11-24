@@ -83,6 +83,9 @@ enum Cmd {
         batch: usize,
         #[arg(long, default_value_t = 1)]
         parallel: usize,
+        /// 单表主键分片并行线程数（默认 1，即单线程）
+        #[arg(long, default_value_t = 1)]
+        table_parallel: usize,
         /// 游标起点: full | resume
         #[arg(long, default_value = "full")]
         cursor: String,
@@ -262,6 +265,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     strip_foreign_keys: None,
                     map_collation: None,
                     filter: None,
+                    table_parallelism: None,
                 })
                 .collect();
             let options = TaskOptions::default();
@@ -307,6 +311,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             tables,
             batch,
             parallel,
+            table_parallel,
             cursor,
             truncate,
             end_id,
@@ -335,11 +340,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     strip_foreign_keys: None,
                     map_collation: None,
                     filter: filter.clone(),
+                    table_parallelism: None,
                 })
                 .collect();
 
             let options = TaskOptions {
                 parallelism: parallel,
+                table_parallelism: table_parallel.max(1),
                 batch_size: batch,
                 adaptive_batch: !no_adaptive,
                 cursor_start: if start_id.is_some() {
@@ -389,12 +396,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                             t.target_max_pk
                         );
                         println!(
-                            "    预计同步 {} 行（{}）",
+                            "    预计同步 {} 行（{}）{}",
                             t.planned_rows,
                             if t.planned_rows_exact {
                                 "源库精确统计"
                             } else {
                                 "区间估算"
+                            },
+                            if t.table_parallelism > 1 {
+                                format!(" · 单表并行 {} 线程", t.table_parallelism)
+                            } else {
+                                String::new()
                             }
                         );
                         for c in &t.checks {

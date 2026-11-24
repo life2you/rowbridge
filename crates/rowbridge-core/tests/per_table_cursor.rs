@@ -56,6 +56,7 @@ fn task_in(
         strip_foreign_keys: None,
         map_collation: None,
         filter: None,
+        table_parallelism: None,
     }
 }
 

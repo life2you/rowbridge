@@ -67,6 +67,7 @@ fn table(src_db: &str, dst_db: &str) -> TableTaskConfig {
         strip_foreign_keys: None,
         map_collation: None,
         filter: None,
+        table_parallelism: None,
     }
 }
 

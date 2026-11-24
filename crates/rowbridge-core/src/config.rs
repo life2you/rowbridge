@@ -153,6 +153,9 @@ pub struct TableTaskConfig {
     /// 其他字段条件过滤（SQL WHERE 表达式，如 `status = 1 AND is_deleted = 0`）
     #[serde(default)]
     pub filter: Option<String>,
+    /// 本表独立的单表并行线程数；None 表示跟随全局 TaskOptions.table_parallelism。
+    #[serde(default)]
+    pub table_parallelism: Option<usize>,
 }
 
 impl TableTaskConfig {
@@ -212,6 +215,13 @@ impl TableTaskConfig {
         self.continue_on_error.unwrap_or(global.continue_on_error)
     }
 
+    /// 解析本表实际生效的单表并发分片线程数：表级优先，其次全局，至少为 1。
+    pub fn effective_table_parallelism(&self, global: &TaskOptions) -> usize {
+        self.table_parallelism
+            .unwrap_or(global.table_parallelism)
+            .max(1)
+    }
+
     /// 是否有表级覆盖设置。
     pub fn has_overrides(&self) -> bool {
         self.has_cursor_override()
@@ -222,6 +232,8 @@ impl TableTaskConfig {
             || self.map_collation.is_some()
             || self.continue_on_error.is_some()
             || self.dst_table.is_some()
+            || self.filter.as_ref().is_some_and(|s| !s.trim().is_empty())
+            || self.table_parallelism.is_some()
     }
 
     /// 是否有表级游标覆盖。
@@ -249,9 +261,12 @@ pub struct TaskConfig {
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct TaskOptions {
-    /// 单表并发数上限（多表并行）。
+    /// 同时并行同步的表数量上限（表级并发）。
     #[serde(default = "default_parallelism")]
     pub parallelism: usize,
+    /// 单表内部主键分片并行线程数（默认 1，即单线程；>1 时按主键区间切分并行）。
+    #[serde(default = "default_table_parallelism")]
+    pub table_parallelism: usize,
     /// 初始批大小
     #[serde(default = "default_batch_size")]
     pub batch_size: usize,
@@ -311,6 +326,9 @@ pub struct TaskOptions {
 fn default_parallelism() -> usize {
     2
 }
+fn default_table_parallelism() -> usize {
+    1
+}
 pub fn default_batch_size() -> usize {
     1000
 }
@@ -328,6 +346,7 @@ impl Default for TaskOptions {
     fn default() -> Self {
         Self {
             parallelism: default_parallelism(),
+            table_parallelism: default_table_parallelism(),
             batch_size: default_batch_size(),
             max_batch_size: default_max_batch_size(),
             adaptive_batch: true,
@@ -412,6 +431,7 @@ mod tests {
             strip_foreign_keys: None,
             map_collation: None,
             filter: None,
+            table_parallelism: None,
         }
     }
 
@@ -487,5 +507,21 @@ mod tests {
             use_tls: false,
         };
         assert!(c.to_url().is_err());
+    }
+
+    #[test]
+    fn table_parallelism_defaults_to_1_and_allows_override() {
+        let global = TaskOptions::default();
+        assert_eq!(global.table_parallelism, 1);
+
+        let mut t = task("a", None, None, None);
+        assert_eq!(t.effective_table_parallelism(&global), 1);
+
+        t.table_parallelism = Some(4);
+        assert_eq!(t.effective_table_parallelism(&global), 4);
+        assert!(t.has_overrides());
+
+        t.table_parallelism = Some(0);
+        assert_eq!(t.effective_table_parallelism(&global), 1);
     }
 }

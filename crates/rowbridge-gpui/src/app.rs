@@ -49,6 +49,7 @@ pub struct RowBridgeApp {
     pub(crate) ed_filter: Entity<InputState>,
     pub(crate) ed_start: Entity<InputState>,
     pub(crate) ed_end: Entity<InputState>,
+    pub(crate) ed_table_parallelism: Entity<InputState>,
     pub(crate) ed_columns: Vec<ColumnInfo>,
     pub(crate) loading_ed_columns: bool,
     pub(crate) table_columns_cache: HashMap<String, Vec<ColumnInfo>>,
@@ -98,6 +99,8 @@ impl RowBridgeApp {
         });
         let ed_start = cx.new(|cx| InputState::new(window, cx).placeholder("起始 ID（含）"));
         let ed_end = cx.new(|cx| InputState::new(window, cx).placeholder("结束 ID（含）"));
+        let ed_table_parallelism =
+            cx.new(|cx| InputState::new(window, cx).placeholder("跟随全局，如 4"));
         let table_filter = cx.new(|cx| InputState::new(window, cx).placeholder("搜索表名…"));
 
         let new_source_name =
@@ -131,6 +134,7 @@ impl RowBridgeApp {
                 ed_filter.clone(),
                 ed_start.clone(),
                 ed_end.clone(),
+                ed_table_parallelism.clone(),
                 table_filter.clone(),
                 new_source_name.clone(),
                 new_source_host.clone(),
@@ -173,6 +177,7 @@ impl RowBridgeApp {
             ed_filter,
             ed_start,
             ed_end,
+            ed_table_parallelism,
             ed_columns: Vec::new(),
             loading_ed_columns: false,
             table_columns_cache: HashMap::new(),
@@ -750,9 +755,15 @@ impl RowBridgeApp {
         let filter = row.over.filter.clone().unwrap_or_default();
         let start = row.over.start_id.clone().unwrap_or_default();
         let end = row.over.end_id.clone().unwrap_or_default();
+        let tp = row
+            .over
+            .table_parallelism
+            .map(|n| n.to_string())
+            .unwrap_or_default();
         set_input(&self.ed_filter, filter, window, cx);
         set_input(&self.ed_start, start, window, cx);
         set_input(&self.ed_end, end, window, cx);
+        set_input(&self.ed_table_parallelism, tp, window, cx);
 
         if let Some(cols) = self.table_columns_cache.get(name) {
             self.ed_columns = cols.clone();
@@ -821,12 +832,24 @@ impl RowBridgeApp {
             .filter(|s| !s.trim().is_empty());
         let start = self.opt.text_of(&self.ed_start, cx);
         let end = self.opt.text_of(&self.ed_end, cx);
+        let tp_raw = self.opt.text_of(&self.ed_table_parallelism, cx);
+        let table_parallelism = match tp_raw {
+            None => None,
+            Some(s) => match s.parse::<usize>() {
+                Ok(n) if n >= 1 => Some(n),
+                _ => {
+                    self.status = Some((false, "单表线程数需为大于 0 的整数".into()));
+                    return;
+                }
+            },
+        };
         if let Some(row) = self.tables.iter_mut().find(|t| t.name == name) {
             row.over.dst_table = None;
             row.over.filter = filter;
             row.over.cursor = Some(self.ed_cursor.unwrap_or(CursorStart::Full));
             row.over.start_id = start;
             row.over.end_id = end;
+            row.over.table_parallelism = table_parallelism;
             row.over.truncate = self.ed_truncate.to_option();
             row.over.create_table = self.ed_create_table.to_option();
             row.over.strip_foreign_keys = self.ed_strip_foreign_keys.to_option();
@@ -1175,6 +1198,7 @@ impl RowBridgeApp {
                 map_collation: t.over.map_collation,
                 continue_on_error: t.over.continue_on_error,
                 filter: t.over.filter.clone(),
+                table_parallelism: t.over.table_parallelism,
             })
             .collect();
         if tables.is_empty() {
@@ -1183,6 +1207,10 @@ impl RowBridgeApp {
         let batch_size = self.opt.usize_of(&self.opt.batch_size, cx, 1000).max(1);
         let options = TaskOptions {
             parallelism: self.opt.usize_of(&self.opt.parallelism, cx, 2).max(1),
+            table_parallelism: self
+                .opt
+                .usize_of(&self.opt.table_parallelism, cx, 1)
+                .max(1),
             batch_size,
             max_batch_size: self
                 .opt
@@ -1388,7 +1416,10 @@ impl RowBridgeApp {
             let mut last_persist = std::time::Instant::now();
             while let Some(ev) = events.recv().await {
                 let tid = tid.clone();
-                let is_batch = matches!(ev, Event::BatchDone { .. });
+                let is_batch = matches!(
+                    ev,
+                    Event::BatchDone { .. } | Event::ShardBatchDone { .. }
+                );
                 let should_notify =
                     !is_batch || last_notify.elapsed() >= std::time::Duration::from_millis(60);
                 if should_notify {
@@ -1527,11 +1558,82 @@ impl RowBridgeApp {
                     p.status = "running";
                 }
             }
+            Event::TableShardsPlanned { table, shards } => {
+                if let Some(p) = task.progress.get_mut(table) {
+                    p.shards = shards
+                        .iter()
+                        .map(|s| ShardProgress {
+                            index: s.index,
+                            range: s.range.clone(),
+                            status: "pending",
+                            rows: 0,
+                            rps: 0.0,
+                            cursor: String::new(),
+                            percent: 0.0,
+                            error: None,
+                        })
+                        .collect();
+                }
+            }
+            Event::ShardBatchDone {
+                table,
+                shard_index,
+                total_rows,
+                cursor,
+                rows_per_sec,
+                percent,
+                ..
+            } => {
+                if let Some(p) = task.progress.get_mut(table) {
+                    if let Some(sp) = p.shards.get_mut(*shard_index) {
+                        sp.status = "running";
+                        sp.rows = *total_rows;
+                        sp.cursor = cursor.clone();
+                        sp.rps = *rows_per_sec;
+                        sp.percent = *percent;
+                    }
+                }
+            }
+            Event::ShardDone {
+                table,
+                shard_index,
+                rows,
+                ..
+            } => {
+                if let Some(p) = task.progress.get_mut(table) {
+                    if let Some(sp) = p.shards.get_mut(*shard_index) {
+                        sp.status = "done";
+                        sp.rows = *rows;
+                        sp.rps = 0.0;
+                        sp.percent = 100.0;
+                    }
+                }
+            }
+            Event::ShardFailed {
+                table,
+                shard_index,
+                error,
+            } => {
+                if let Some(p) = task.progress.get_mut(table) {
+                    if let Some(sp) = p.shards.get_mut(*shard_index) {
+                        sp.status = "failed";
+                        sp.rps = 0.0;
+                        sp.error = Some(error.clone());
+                    }
+                }
+            }
             Event::TableDone { table, rows, .. } => {
                 if let Some(p) = task.progress.get_mut(table) {
                     p.rows = *rows;
                     p.status = "done";
                     p.rps = 0.0;
+                    for sp in &mut p.shards {
+                        if sp.status == "running" || sp.status == "pending" {
+                            sp.status = "done";
+                            sp.rps = 0.0;
+                            sp.percent = 100.0;
+                        }
+                    }
                 }
                 task.logs.push(TaskLogEntry {
                     time: chrono::Local::now().format("%H:%M:%S").to_string().into(),
@@ -1543,7 +1645,14 @@ impl RowBridgeApp {
             Event::TableFailed { table, error } => {
                 if let Some(p) = task.progress.get_mut(table) {
                     p.status = "failed";
+                    p.rps = 0.0;
                     p.error = Some(error.clone());
+                    for sp in &mut p.shards {
+                        if sp.status == "running" || sp.status == "pending" {
+                            sp.status = "cancelled";
+                            sp.rps = 0.0;
+                        }
+                    }
                 }
                 task.logs.push(TaskLogEntry {
                     time: chrono::Local::now().format("%H:%M:%S").to_string().into(),
@@ -1574,6 +1683,17 @@ impl RowBridgeApp {
             }
             Event::Cancelled => {
                 task.status = TaskStatus::Cancelled;
+                for p in task.progress.values_mut() {
+                    if p.status == "running" {
+                        p.rps = 0.0;
+                    }
+                    for sp in &mut p.shards {
+                        if sp.status == "running" || sp.status == "pending" {
+                            sp.status = "cancelled";
+                            sp.rps = 0.0;
+                        }
+                    }
+                }
                 task.logs.push(TaskLogEntry {
                     time: chrono::Local::now().format("%H:%M:%S").to_string().into(),
                     level: "warn".into(),
@@ -1777,6 +1897,10 @@ impl RowBridgeApp {
                     elapsed_ms,
                 );
             }
+            E::TableShardsPlanned { .. }
+            | E::ShardBatchDone { .. }
+            | E::ShardDone { .. }
+            | E::ShardFailed { .. } => {}
             E::TableDone {
                 table,
                 rows,

@@ -102,6 +102,13 @@ pub struct TablePreflight {
     /// 本表生效的其他字段条件过滤（SQL WHERE 表达式）
     #[serde(default)]
     pub filter: Option<String>,
+    /// 本表生效的单表并发分片线程数
+    #[serde(default = "default_one")]
+    pub table_parallelism: usize,
+}
+
+fn default_one() -> usize {
+    1
 }
 
 impl TablePreflight {
@@ -521,6 +528,9 @@ async fn check_table(
         }
     }
 
+    let table_parallelism = task.effective_table_parallelism(options);
+    check_parallel_resume(table_parallelism, cursor_start, &mut checks);
+
     // ---- 预计行数 ----
     //
     // 光看 information_schema.TABLES.TABLE_ROWS 和主键区间会严重高估：
@@ -609,6 +619,7 @@ async fn check_table(
         start_id,
         end_id,
         filter: task.effective_filter(),
+        table_parallelism,
     })
 }
 
@@ -1286,5 +1297,32 @@ mod tests {
         };
         assert!(same_instance(&c1, &c2));
         assert!(!same_instance(&c1, &c3));
+    }
+
+    #[test]
+    fn warns_when_parallel_table_uses_resume() {
+        let mut checks = Vec::new();
+        check_parallel_resume(4, crate::config::CursorStart::Resume, &mut checks);
+        assert!(checks.iter().any(|c| c.code == "parallel_resume_caveat"));
+
+        let mut ok_checks = Vec::new();
+        check_parallel_resume(4, crate::config::CursorStart::Custom, &mut ok_checks);
+        check_parallel_resume(1, crate::config::CursorStart::Resume, &mut ok_checks);
+        assert!(ok_checks.is_empty());
+    }
+}
+
+fn check_parallel_resume(
+    table_parallelism: usize,
+    cursor_start: crate::config::CursorStart,
+    checks: &mut Vec<Check>,
+) {
+    if table_parallelism > 1 && cursor_start == crate::config::CursorStart::Resume {
+        checks.push(Check::warn(
+            "parallel_resume_caveat",
+            format!(
+                "已启用单表 {table_parallelism} 线程并行且使用「续传」模式：各分片乱序推进，若中途失败或取消会导致目标 MAX(pk) 偏大，后续不能再用续传接续"
+            ),
+        ));
     }
 }

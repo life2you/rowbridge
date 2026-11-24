@@ -889,26 +889,34 @@ impl RowBridgeApp {
         let muted = cx.theme().muted_foreground;
 
         h_flex()
-            .gap_3()
+            .gap_2()
             .items_end()
+            .flex_wrap()
             .flex_shrink_0()
             .child(
                 v_flex()
-                    .w(px(64.))
+                    .w(px(58.))
                     .gap_1()
-                    .child(field_label("并发", muted))
+                    .child(field_label("表并发", muted))
                     .child(Input::new(&self.opt.parallelism).small()),
             )
             .child(
                 v_flex()
-                    .w(px(90.))
+                    .w(px(66.))
+                    .gap_1()
+                    .child(field_label("单表线程", muted))
+                    .child(Input::new(&self.opt.table_parallelism).small()),
+            )
+            .child(
+                v_flex()
+                    .w(px(80.))
                     .gap_1()
                     .child(field_label("批大小", muted))
                     .child(Input::new(&self.opt.batch_size).small()),
             )
             .child(
                 v_flex()
-                    .w(px(96.))
+                    .w(px(86.))
                     .gap_1()
                     .child(field_label("批量上限", muted))
                     .child(Input::new(&self.opt.max_batch_size).small()),
@@ -1016,7 +1024,9 @@ impl RowBridgeApp {
         let hover_bg = cx.theme().list_hover;
         let danger = cx.theme().danger;
         let warning = cx.theme().warning;
+        let info = cx.theme().info;
         let fg = cx.theme().foreground;
+        let global_tp = self.opt.usize_of(&self.opt.table_parallelism, cx, 1).max(1);
 
         let planned_of = |name: &str| -> Option<u64> {
             self.report
@@ -1254,6 +1264,13 @@ impl RowBridgeApp {
 
             if has_filter {
                 name_cell = name_cell.child(chip("过滤", warning, accent));
+            }
+
+            let eff_tp = row.over.table_parallelism.unwrap_or(global_tp).max(1);
+            if eff_tp > 1 {
+                name_cell = name_cell.child(chip(format!("{eff_tp}线程"), info, accent));
+            } else if row.over.table_parallelism == Some(1) && global_tp > 1 {
+                name_cell = name_cell.child(chip("单线程", muted, accent));
             }
 
             if row.over.truncate == Some(true) {
@@ -1553,6 +1570,35 @@ impl RowBridgeApp {
                     ),
             );
         }
+
+        let mut tp_row = h_flex()
+            .gap_2()
+            .items_center()
+            .child(field_label("单表并发线程", muted))
+            .child(
+                div()
+                    .w(px(110.))
+                    .child(Input::new(&self.ed_table_parallelism).small()),
+            );
+        for (btn_id, label_txt, val) in [
+            ("ed-tp-follow", "跟随全局", ""),
+            ("ed-tp-2", "2线程", "2"),
+            ("ed-tp-4", "4线程", "4"),
+            ("ed-tp-8", "8线程", "8"),
+        ] {
+            let val_s = val.to_string();
+            tp_row = tp_row.child(
+                Button::new(btn_id)
+                    .xsmall()
+                    .ghost()
+                    .label(label_txt)
+                    .on_click(cx.listener(move |this, _: &ClickEvent, window, cx| {
+                        set_input(&this.ed_table_parallelism, val_s.clone(), window, cx);
+                        cx.notify();
+                    })),
+            );
+        }
+        block = block.child(tp_row);
 
         let opt_row_1 = h_flex()
             .gap_2()

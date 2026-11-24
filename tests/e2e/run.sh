@@ -195,6 +195,20 @@ else
 fi
 
 echo
+echo "== 18. 单表多线程分片并行（CLI + 集成测试） =="
+dst_exec "DROP TABLE IF EXISTS db_b.bulk"
+OUT=$(sync --table bulk --start-id 1 --end-id 10000 --table-parallel 4 --batch 400 --no-adaptive)
+echo "$OUT" | grep -q '#1 \[1\.\.=2500\]' && ok "CLI 分片 #1 [1..=2500]" || bad "CLI 分片 #1 [1..=2500]" "含 #1 [1..=2500]" "$OUT"
+echo "$OUT" | grep -q '#4 \[7501\.\.=10000\]' && ok "CLI 分片 #4 [7501..=10000]" || bad "CLI 分片 #4 [7501..=10000]" "含 #4 [7501..=10000]" "$OUT"
+eq "单表 4 线程同步总行数" "10000" "$(dst_mysql "SELECT COUNT(*) FROM bulk")"
+eq "单表 4 线程同步校验和" "$(src_mysql "SELECT SUM(n) FROM bulk")" "$(dst_mysql "SELECT SUM(n) FROM bulk")"
+if cargo test -p rowbridge-core --test parallel_table -- --nocapture 2>&1 | grep -q "test result: ok"; then
+  ok "单表多线程集成测试（区间/全量/续传）"
+else
+  bad "单表多线程集成测试" "test result: ok" "见 cargo test 输出"
+fi
+
+echo
 echo "==================================="
 printf "通过 \033[32m%d\033[0m，失败 \033[31m%d\033[0m\n" "$PASS" "$FAIL"
 [ "$FAIL" -eq 0 ] || exit 1

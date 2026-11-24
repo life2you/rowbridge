@@ -90,6 +90,22 @@ pub fn parse_cursor_value(input: &str, unsigned: bool) -> crate::Result<Value> {
     }
 }
 
+/// 把归一化后的 `i128` 边界值还原为与主键列符号匹配的 `Value`。
+///
+/// 分片边界计算都在 `i128` 域完成，下推给预处理语句参数时必须按 `unsigned`
+/// 还原为 `UInt` 或 `Int`，避免 `bigint unsigned` 上半段溢出或编码失配。
+pub fn i128_to_pk_value(v: i128, unsigned: bool) -> crate::Result<Value> {
+    if unsigned {
+        u64::try_from(v)
+            .map(Value::UInt)
+            .map_err(|_| crate::Error::Config(format!("游标值 `{v}` 超出无符号整型范围")))
+    } else {
+        i64::try_from(v)
+            .map(Value::Int)
+            .map_err(|_| crate::Error::Config(format!("游标值 `{v}` 超出有符号整型范围")))
+    }
+}
+
 /// 值的可读展示（日志用），长文本截断。
 pub fn value_to_display(v: &Value) -> String {
     match v {
@@ -208,5 +224,16 @@ mod tests {
         let s = value_to_display(&v);
         assert!(s.ends_with("(200)"));
         assert!(s.chars().count() < 90);
+    }
+
+    #[test]
+    fn converts_i128_back_to_pk_value_by_sign() {
+        assert_eq!(i128_to_pk_value(-10, false).unwrap(), Value::Int(-10));
+        assert_eq!(
+            i128_to_pk_value(u64::MAX as i128, true).unwrap(),
+            Value::UInt(u64::MAX)
+        );
+        assert!(i128_to_pk_value(-1, true).is_err());
+        assert!(i128_to_pk_value(u64::MAX as i128, false).is_err());
     }
 }

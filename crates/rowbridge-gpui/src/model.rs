@@ -213,6 +213,7 @@ pub fn set_input(
 /// 批量参数与高级选项。
 pub struct OptionsPanel {
     pub parallelism: Entity<InputState>,
+    pub table_parallelism: Entity<InputState>,
     pub batch_size: Entity<InputState>,
     pub max_batch_size: Entity<InputState>,
     pub global_start: Entity<InputState>,
@@ -238,6 +239,11 @@ impl OptionsPanel {
                 .placeholder("并发")
                 .default_value("2")
         });
+        let table_parallelism = cx.new(|cx| {
+            InputState::new(window, cx)
+                .placeholder("单表线程")
+                .default_value("1")
+        });
         let batch_size = cx.new(|cx| {
             InputState::new(window, cx)
                 .placeholder("批大小")
@@ -252,6 +258,7 @@ impl OptionsPanel {
         let global_end = cx.new(|cx| InputState::new(window, cx).placeholder("结束 ID"));
         Self {
             parallelism,
+            table_parallelism,
             batch_size,
             max_batch_size,
             global_start,
@@ -274,6 +281,7 @@ impl OptionsPanel {
     pub fn inputs(&self) -> Vec<Entity<InputState>> {
         vec![
             self.parallelism.clone(),
+            self.table_parallelism.clone(),
             self.batch_size.clone(),
             self.max_batch_size.clone(),
             self.global_start.clone(),
@@ -305,6 +313,7 @@ pub struct TableOverride {
     pub start_id: Option<String>,
     pub end_id: Option<String>,
     pub filter: Option<String>,
+    pub table_parallelism: Option<usize>,
     pub truncate: Option<bool>,
     pub create_table: Option<bool>,
     pub strip_foreign_keys: Option<bool>,
@@ -320,6 +329,7 @@ impl TableOverride {
             || self.start_id.is_some()
             || self.end_id.is_some()
             || self.filter.is_some()
+            || self.table_parallelism.is_some()
             || self.truncate.is_some()
             || self.create_table.is_some()
             || self.strip_foreign_keys.is_some()
@@ -349,6 +359,20 @@ pub struct LogEntry {
     pub message: SharedString,
 }
 
+/// 单表内某个并行分片的实时进度。
+#[derive(Debug, Clone)]
+pub struct ShardProgress {
+    pub index: usize,
+    pub range: String,
+    pub status: &'static str,
+    pub rows: u64,
+    pub rps: f64,
+    pub cursor: String,
+    pub percent: f32,
+    #[allow(dead_code)]
+    pub error: Option<String>,
+}
+
 /// 引擎事件的 UI 视图。
 #[derive(Debug, Clone)]
 pub struct TableProgress {
@@ -358,6 +382,7 @@ pub struct TableProgress {
     pub rps: f64,
     pub cursor: String,
     pub error: Option<String>,
+    pub shards: Vec<ShardProgress>,
 }
 
 impl TableProgress {
@@ -369,6 +394,7 @@ impl TableProgress {
             rps: 0.0,
             cursor: String::new(),
             error: None,
+            shards: Vec::new(),
         }
     }
     pub fn percent(&self) -> f32 {

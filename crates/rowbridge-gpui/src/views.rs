@@ -966,7 +966,8 @@ impl RowBridgeApp {
                 });
             body = body.child(stats_card);
 
-            // 2. 表级子进度清单
+            // 2. 表级子进度清单（若单表开启了多线程分片，同时展开各分片线程进度）
+            let mut has_shards = false;
             let mut table_rows = v_flex().gap_1();
             for tbl in &task.tables {
                 let p = task
@@ -974,6 +975,9 @@ impl RowBridgeApp {
                     .get(tbl)
                     .cloned()
                     .unwrap_or_else(|| TableProgress::pending(0));
+                if !p.shards.is_empty() {
+                    has_shards = true;
+                }
                 let tbl_pct = p.percent();
                 let tbl_status_badge = match p.status {
                     "running" => chip(format!("{:.0} 行/s", p.rps), cx.theme().primary, card_bg),
@@ -982,61 +986,149 @@ impl RowBridgeApp {
                     _ => chip("排队中", muted, card_bg),
                 };
 
-                table_rows = table_rows.child(
-                    v_flex()
-                        .p_2()
-                        .rounded_md()
-                        .bg(accent)
-                        .gap_1()
-                        .child(
+                let mut header_right = h_flex().gap_1p5().items_center();
+                if !p.shards.is_empty() {
+                    header_right = header_right.child(chip(
+                        format!("{} 线程", p.shards.len()),
+                        cx.theme().info,
+                        card_bg,
+                    ));
+                }
+                header_right = header_right.child(tbl_status_badge);
+
+                let mut card = v_flex()
+                    .p_2()
+                    .rounded_md()
+                    .bg(accent)
+                    .gap_1()
+                    .child(
+                        h_flex()
+                            .justify_between()
+                            .items_center()
+                            .child(
+                                div()
+                                    .text_xs()
+                                    .font_weight(FontWeight::MEDIUM)
+                                    .child(tbl.clone()),
+                            )
+                            .child(header_right),
+                    )
+                    .child(
+                        div().h(px(3.)).w_full().rounded_full().bg(card_bg).child(
+                            div()
+                                .h_full()
+                                .w(gpui::relative(tbl_pct / 100.0))
+                                .rounded_full()
+                                .bg(if p.status == "done" {
+                                    success
+                                } else {
+                                    cx.theme().primary
+                                }),
+                        ),
+                    )
+                    .child(
+                        h_flex()
+                            .justify_between()
+                            .items_center()
+                            .child(mono(
+                                format!(
+                                    "{} / {} 行",
+                                    human_rows(p.rows),
+                                    human_rows(p.planned)
+                                ),
+                                muted,
+                            ))
+                            .child(mono(
+                                if p.cursor.is_empty() {
+                                    String::new()
+                                } else {
+                                    format!("游标: {}", p.cursor)
+                                },
+                                muted,
+                            )),
+                    );
+
+                if !p.shards.is_empty() {
+                    let mut shards_box = v_flex()
+                        .mt_1()
+                        .pl_2()
+                        .border_l_2()
+                        .border_color(border)
+                        .gap_1();
+                    for sp in &p.shards {
+                        let sp_color = match sp.status {
+                            "done" => success,
+                            "failed" => danger,
+                            "cancelled" => warning,
+                            _ => cx.theme().primary,
+                        };
+                        let sp_badge = match sp.status {
+                            "running" => {
+                                chip(format!("{:.0} 行/s", sp.rps), cx.theme().primary, card_bg)
+                            }
+                            "done" => chip("完成", success, card_bg),
+                            "failed" => chip("失败", danger, card_bg),
+                            "cancelled" => chip("已取消", warning, card_bg),
+                            _ => chip("等待", muted, card_bg),
+                        };
+                        shards_box = shards_box.child(
                             h_flex()
-                                .justify_between()
+                                .gap_2()
                                 .items_center()
+                                .text_xs()
                                 .child(
                                     div()
-                                        .text_xs()
-                                        .font_weight(FontWeight::MEDIUM)
-                                        .child(tbl.clone()),
+                                        .w(px(155.))
+                                        .flex_shrink_0()
+                                        .truncate()
+                                        .child(mono(
+                                            format!("#{} {}", sp.index + 1, sp.range),
+                                            muted,
+                                        )),
                                 )
-                                .child(tbl_status_badge),
-                        )
-                        .child(
-                            div().h(px(3.)).w_full().rounded_full().bg(card_bg).child(
-                                div()
-                                    .h_full()
-                                    .w(gpui::relative(tbl_pct / 100.0))
-                                    .rounded_full()
-                                    .bg(if p.status == "done" {
-                                        success
-                                    } else {
-                                        cx.theme().primary
-                                    }),
-                            ),
-                        )
-                        .child(
-                            h_flex()
-                                .justify_between()
-                                .items_center()
-                                .child(mono(
-                                    format!(
-                                        "{} / {} 行",
-                                        human_rows(p.rows),
-                                        human_rows(p.planned)
+                                .child(
+                                    div()
+                                        .flex_1()
+                                        .min_w(px(60.))
+                                        .h(px(3.))
+                                        .rounded_full()
+                                        .bg(card_bg)
+                                        .child(
+                                            div()
+                                                .h_full()
+                                                .w(gpui::relative(sp.percent.clamp(0.0, 100.0) / 100.0))
+                                                .rounded_full()
+                                                .bg(sp_color),
+                                        ),
+                                )
+                                .child(
+                                    div().w(px(95.)).flex_shrink_0().text_right().child(mono(
+                                        format!("{:>3.0}% · {}行", sp.percent, human_rows(sp.rows)),
+                                        muted,
+                                    )),
+                                )
+                                .child(
+                                    div().w(px(88.)).flex_shrink_0().text_right().truncate().child(
+                                        mono(
+                                            if sp.cursor.is_empty() {
+                                                "-".to_string()
+                                            } else {
+                                                format!("游标 {}", sp.cursor)
+                                            },
+                                            muted,
+                                        ),
                                     ),
-                                    muted,
-                                ))
-                                .child(mono(
-                                    if p.cursor.is_empty() {
-                                        String::new()
-                                    } else {
-                                        format!("游标: {}", p.cursor)
-                                    },
-                                    muted,
-                                )),
-                        ),
-                );
+                                )
+                                .child(sp_badge),
+                        );
+                    }
+                    card = card.child(shards_box);
+                }
+
+                table_rows = table_rows.child(card);
             }
 
+            let list_max_h = if has_shards { px(360.) } else { px(260.) };
             body = body.child(
                 v_flex()
                     .gap_1p5()
@@ -1044,7 +1136,7 @@ impl RowBridgeApp {
                     .child(
                         div()
                             .id("table-prog-scroll")
-                            .max_h(px(260.))
+                            .max_h(list_max_h)
                             .overflow_y_scrollbar()
                             .child(table_rows),
                     ),
